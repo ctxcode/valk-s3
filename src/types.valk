@@ -1,0 +1,70 @@
+/// What is known about a stored object.
+///
+/// `head_object` and the downloads fill in everything but `storage_class`; a listing fills in
+/// `key`, `size`, `etag`, `last_modified` and `storage_class`.
++ class ObjectInfo {
+    + key: String ("")
+    /// The size in bytes; for a ranged download, the size of the part that was sent.
+    + size: uint (0)
+    /// The entity tag, without quotes. For a single upload the hex MD5 of the content; for a
+    /// multipart upload it ends in `-` and the number of parts.
+    + etag: String ("")
+    /// As the server wrote it: an HTTP date for `head_object`, ISO 8601 in a listing.
+    + last_modified: String ("")
+    + content_type: String ("")
+    + storage_class: String ("")
+    /// The user metadata (`x-amz-meta-*` headers), by lowercase name without the prefix.
+    + metadata: Map[String] (.{})
+}
+
+/// Settings for an upload or a copy.
++ class PutOptions {
+    /// The `Content-Type` stored with the object. Empty lets `put_file` guess it from the file
+    /// extension; the server stores `binary/octet-stream` or similar for the others.
+    + content_type: String ("")
+    /// User metadata, sent as `x-amz-meta-<name>` headers. Names are stored in lowercase.
+    + metadata: Map[String] (.{})
+    /// Other headers to send, such as `Cache-Control`, `Content-Disposition`, `x-amz-acl` or
+    /// `x-amz-storage-class`.
+    + headers: Map[String] (.{})
+}
+
+/// Settings for a download.
++ class GetOptions {
+    /// The first byte to download.
+    + offset: uint (0)
+    /// The number of bytes to download from `offset` on; 0 downloads up to the end.
+    + length: uint (0)
+}
+
+/// Settings for one page of `list_objects`.
++ class ListOptions {
+    /// Only keys that start with this.
+    + prefix: String ("")
+    /// Groups keys that contain this after the prefix into `ListPage.prefixes`, like
+    /// directories, usually `/`. Empty lists every key.
+    + delimiter: String ("")
+    /// The most keys in one page; the server sends at most 1000.
+    + max_keys: uint (1000)
+    /// The `next_token` of the previous page, to read the page after it.
+    + continuation_token: String ("")
+    /// Only keys that sort after this one.
+    + start_after: String ("")
+}
+
+/// One page of keys from `list_objects`, or all of them from `list_all`.
++ class ListPage {
+    + objects: Array[ObjectInfo] (.{})
+    /// The groups of keys `delimiter` made, each ending in the delimiter, like `photos/`.
+    + prefixes: Array[String] (.{})
+    /// Whether more pages follow; pass `next_token` as `continuation_token` to read the next one.
+    + truncated: bool (false)
+    + next_token: String ("")
+}
+
+/// A key that `delete_objects` could not delete, with the server's error code and message.
++ class DeleteFailure {
+    + key: String
+    + code: String
+    + message: String
+}

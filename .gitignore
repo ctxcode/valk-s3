@@ -1,0 +1,7 @@
+debug
+vendor
+tests/vendor
+example/vendor
+tests/tmp
+bench/vendor
+bench/run

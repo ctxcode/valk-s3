@@ -1,0 +1,87 @@
+use s3
+use valk.fs
+
+// Parts of the smallest size S3 allows, to keep the uploads quick
+fn multipart_client(concurrency: uint) s3.Client {
+    let config = test_config()
+    config.multipart_threshold = 6 * 1024 * 1024
+    config.part_size = 5 * 1024 * 1024
+    config.upload_concurrency = concurrency
+    return s3.Client.new(config) !!
+}
+
+test "Multipart: put_object above the threshold" {
+    let c = multipart_client(4)
+    let bucket = fresh_bucket(c, "mp-object")
+    let data = pattern(17 * 1024 * 1024 + 3)
+    let etag = c.put_object(bucket, "big", data, s3.PutOptions { content_type: "application/x-big", metadata: .{ "m" => "1" } }) !!
+    assert(etag.ends_with("-4"))
+    assert((c.get_object(bucket, "big") !!) == data)
+    let info = c.head_object(bucket, "big") !!
+    assert(info.size == data.length)
+    assert(info.content_type == "application/x-big")
+    assert((info.metadata.get("m") !? "") == "1")
+}
+
+test "Multipart: put_file small and large" {
+    let c = multipart_client(2)
+    let bucket = fresh_bucket(c, "mp-file")
+    fs.create_dir_all(tmp_dir()) _
+    let small = tmp_dir() + "/upload-small.html"
+    fs.write(small, "<p>hi</p>") !!
+    c.put_file(bucket, "small.html", small) !!
+    let small_info = c.head_object(bucket, "small.html") !!
+    assert(small_info.content_type == "text/html")
+
+    let large = tmp_dir() + "/upload-large.bin"
+    let data = pattern(11 * 1024 * 1024, 3)
+    fs.write(large, data) !!
+    let etag = c.put_file(bucket, "large.bin", large) !!
+    assert(etag.ends_with("-3"))
+    assert((c.get_object(bucket, "large.bin") !!) == data)
+    fs.delete_file(small) _
+    fs.delete_file(large) _
+
+    let failed = false
+    c.put_file(bucket, "x", tmp_dir() + "/does-not-exist") ! {
+        failed = E.code == E.io
+    }
+    assert(failed)
+}
+
+test "Multipart: put_stream without a known size" {
+    let c = multipart_client(3)
+    let bucket = fresh_bucket(c, "mp-stream")
+    let small = pattern(100000)
+    c.put_stream(bucket, "small", SlowReader { data: small }) !!
+    assert((c.get_object(bucket, "small") !!) == small)
+
+    // Exactly the threshold stays one upload, one byte more goes in parts
+    let edge = pattern(6 * 1024 * 1024)
+    assert(!(c.put_stream(bucket, "edge", SlowReader { data: edge }) !!).contains("-"))
+    let over = pattern(6 * 1024 * 1024 + 1)
+    assert((c.put_stream(bucket, "over", SlowReader { data: over }) !!).ends_with("-2"))
+    assert((c.get_object(bucket, "over") !!) == over)
+
+    // A multiple of the part size ends without an empty part
+    let exact = pattern(10 * 1024 * 1024, 9)
+    assert((c.put_stream(bucket, "exact", SlowReader { data: exact }) !!).ends_with("-2"))
+    assert((c.get_object(bucket, "exact") !!) == exact)
+}
+
+test "Multipart: sequential parts" {
+    let c = multipart_client(1)
+    let bucket = fresh_bucket(c, "mp-sequential")
+    let data = pattern(12 * 1024 * 1024, 5)
+    assert((c.put_object(bucket, "seq", data) !!).ends_with("-3"))
+    assert((c.get_object(bucket, "seq") !!) == data)
+}
+
+test "Multipart: a failed upload is aborted" {
+    let c = multipart_client(2)
+    let failed = false
+    c.put_object("valk-s3-no-such-bucket", "big", pattern(7 * 1024 * 1024)) ! {
+        failed = E.code == E.not_found && E.s3_code == "NoSuchBucket"
+    }
+    assert(failed)
+}

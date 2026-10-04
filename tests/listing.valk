@@ -1,0 +1,91 @@
+use s3
+
+test "Listing: pages, prefixes and the iterator" {
+    let c = client()
+    let bucket = fresh_bucket(c, "listing")
+    each 0 .. 25 as i {
+        c.put_object(bucket, "logs/" + ("" + i).pad_left('0', 2) + ".txt", "x" + i) !!
+    }
+    c.put_object(bucket, "photos/a/1.jpg", "1") !!
+    c.put_object(bucket, "photos/b/2.jpg", "2") !!
+    c.put_object(bucket, "photos/top.jpg", "top") !!
+    c.put_object(bucket, "readme", "r") !!
+
+    // Pages of ten
+    let options = s3.ListOptions { prefix: "logs/", max_keys: 10 }
+    let pages = 0
+    let keys = Array[String]{}
+    while true {
+        let page = c.list_objects(bucket, options) !!
+        pages++
+        each page.objects as obj : keys.append(obj.key)
+        if !page.truncated : break
+        options.continuation_token = page.next_token
+    }
+    assert(pages == 3)
+    assert(keys.length == 25)
+    assert((keys.get(0) !? "") == "logs/00.txt")
+    assert((keys.get(24) !? "") == "logs/24.txt")
+
+    let first = c.list_objects(bucket, s3.ListOptions { prefix: "logs/1", max_keys: 3 }) !!
+    let o = first.objects.get(0) !!
+    assert(o.key == "logs/10.txt")
+    assert(o.size == 3)
+    assert(o.etag.length == 32)
+    assert(o.last_modified.contains("T"))
+    assert(o.storage_class == "STANDARD")
+
+    // Delimiter
+    let top = c.list_all(bucket, "", "/") !!
+    assert(top.objects.length == 1)
+    assert((top.objects.get(0) !!).key == "readme")
+    assert(top.prefixes.length == 2)
+    assert(top.prefixes.contains("logs/") && top.prefixes.contains("photos/"))
+    let photos = c.list_all(bucket, "photos/", "/") !!
+    assert(photos.objects.length == 1)
+    assert(photos.prefixes.length == 2)
+
+    // start_after
+    let after = c.list_objects(bucket, s3.ListOptions { prefix: "logs/", start_after: "logs/22.txt" }) !!
+    assert(after.objects.length == 2)
+
+    // The iterator reads page by page
+    let all = c.list_all(bucket) !!
+    assert(all.objects.length == 29)
+    let iter = c.objects(bucket, "logs/")
+    let count = 0
+    let last = ""
+    let ordered = true
+    while true {
+        let obj = iter.next() !!
+        if !isset(obj) : break
+        if obj.key <= last : ordered = false
+        last = obj.key
+        count++
+    }
+    assert(count == 25)
+    assert(ordered)
+    assert(!isset(iter.next() !!))
+
+    let empty = c.list_all(bucket, "nothing/") !!
+    assert(empty.objects.length == 0)
+}
+
+test "Listing: an iterator over more than one page" {
+    let c = client()
+    let bucket = fresh_bucket(c, "listing-pages")
+    let tasks = Array[co(bool)]{}
+    each 0 .. 1203 as i {
+        tasks.append(co put_small(c, bucket, "n/" + i))
+        if tasks.length >= 16 : await (tasks.pop_first() !!)
+    }
+    each tasks as t : await t
+    let iter = c.objects(bucket)
+    let count = 0
+    while true {
+        let obj = iter.next() !!
+        if !isset(obj) : break
+        count++
+    }
+    assert(count == 1203)
+}

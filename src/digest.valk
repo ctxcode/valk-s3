@@ -1,0 +1,39 @@
+// SHA-256 of request bodies through libcrypto, which the stdlib links for TLS already;
+// it hashes large bodies far faster than a hash written in valk
+
+use valk.crypto
+
+#if OS == "win"
+link "libcrypto"
+#else
+link "crypto"
+#end
+
+pointer EVP_MD_CTX {}
+pointer EVP_MD {}
+
+extern fn EVP_MD_CTX_new() ?EVP_MD_CTX;
+extern fn EVP_MD_CTX_free(ctx: EVP_MD_CTX) void;
+extern fn EVP_DigestInit_ex(ctx: EVP_MD_CTX, md: EVP_MD, engine: ?ptr) i32;
+extern fn EVP_DigestUpdate(ctx: EVP_MD_CTX, data: ptr, length: uint) i32;
+extern fn EVP_DigestFinal_ex(ctx: EVP_MD_CTX, out: ptr, length: ?ptr) i32;
+extern fn EVP_sha256() EVP_MD;
+
+/// The SHA-256 of an empty body, as lowercase hex.
++ value EMPTY_SHA256 ("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+/// Returns the SHA-256 of `data` as lowercase hex, the form a payload hash takes in a signature.
++ fn sha256_hex(data: local &[u8]) String {
+    if data.length == 0 : return EMPTY_SHA256
+    @unsafe
+    let ctx = EVP_MD_CTX_new()
+    if !isset(ctx) : return crypto.hash_hex(crypto.HashAlgorithm.sha256, data)
+    let digest: [u8 x 32] = @undefined
+    let ok = EVP_DigestInit_ex(ctx, EVP_sha256(), null) == 1
+    if ok : ok = EVP_DigestUpdate(ctx, data.data, data.length) == 1
+    if ok : ok = EVP_DigestFinal_ex(ctx, @ref(digest), null) == 1
+    EVP_MD_CTX_free(ctx)
+    if !ok : return crypto.hash_hex(crypto.HashAlgorithm.sha256, data)
+    let raw: local &[u8] = &digest
+    return crypto.hex_encode(raw)
+}

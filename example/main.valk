@@ -1,0 +1,40 @@
+// Runs against the MinIO server of tests/server.sh, or any service set in the AWS_* variables
+use s3
+
+fn main() {
+    let config = s3.Config.from_env()
+    if config.endpoint.length == 0 {
+        config = s3.Config { endpoint: "http://127.0.0.1:9100", access_key: "valktest", secret_key: "valktest-secret" }
+    }
+    config.path_style = true
+    let client = s3.Client.new(config) ! panic(E.message)
+    defer client.close()
+
+    let bucket = "valk-s3-example"
+    if !(client.bucket_exists(bucket) ! panic(E.message)) {
+        client.create_bucket(bucket) ! panic(E.message)
+    }
+
+    // Upload, with a content type and metadata
+    let etag = client.put_object(bucket, "notes/hello.txt", "Hello from valk", s3.PutOptions {
+        content_type: "text/plain"
+        metadata: .{ "author" => "ada" }
+    }) ! panic(E.message)
+    println("uploaded, etag " + etag)
+
+    // Download
+    let text = client.get_object(bucket, "notes/hello.txt") ! panic(E.message)
+    println("downloaded: " + text)
+    let info = client.head_object(bucket, "notes/hello.txt") ! panic(E.message)
+    println("%{info.size} bytes, %{info.content_type}, author %{info.metadata.get("author") !? "?"}")
+
+    // List
+    let listing = client.list_all(bucket, "notes/") ! panic(E.message)
+    each listing.objects as obj : println("listed " + obj.key)
+
+    // A link anyone can download from for an hour
+    println(client.presign_get(bucket, "notes/hello.txt", 3600))
+
+    client.delete_object(bucket, "notes/hello.txt") ! panic(E.message)
+    client.delete_bucket(bucket) ! panic(E.message)
+}

@@ -1,0 +1,145 @@
+use s3
+
+// The aws-sig-v4-test-suite credentials and request time (2015-08-30T12:36:00Z)
+fn suite_signer() s3.Signer {
+    return s3.Signer { access_key: "AKIDEXAMPLE", secret_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", service: "service" }
+}
+value SUITE_TIME (1440938160)
+
+// The credentials and time (2013-05-24) of the examples in the S3 signature documentation
+fn s3_doc_signer() s3.Signer {
+    return s3.Signer { access_key: "AKIAIOSFODNN7EXAMPLE", secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" }
+}
+value DOC_TIME (1369353600)
+
+fn signature_of(auth: String) String {
+    let at = auth.index_of("Signature=") !? 0
+    return auth.range(at + 10, auth.length - at - 10)
+}
+
+fn suite_headers() Map[String] {
+    return Map[String]{ "Host" => "example.amazonaws.com" }
+}
+
+test "Signing: amz_date" {
+    assert(s3.amz_date(0) == "19700101T000000Z")
+    assert(s3.amz_date(SUITE_TIME) == "20150830T123600Z")
+    assert(s3.amz_date(951868799) == "20000229T235959Z")
+    assert(s3.amz_date(4107542400) == "21000301T000000Z")
+}
+
+test "Signing: uri_encode" {
+    assert(s3.uri_encode("a b+c/é~.-_") == r"a%20b%2Bc%2F%C3%A9~.-_")
+    assert(s3.uri_encode("dir/a b.txt", true) == "dir/a%20b.txt")
+    assert(s3.uri_encode("plain-Key_1.txt") == "plain-Key_1.txt")
+    assert(s3.uri_encode("") == "")
+}
+
+test "Signing: aws-sig-v4-test-suite get-vanilla" {
+    let auth = suite_signer().sign("GET", "/", null, suite_headers(), s3.EMPTY_SHA256, SUITE_TIME)
+    assert(auth == "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31")
+}
+
+test "Signing: aws-sig-v4-test-suite get-vanilla-query-order-key-case" {
+    let query = Map[String]{ "Param2" => "value2", "Param1" => "value1" }
+    let auth = suite_signer().sign("GET", "/", query, suite_headers(), s3.EMPTY_SHA256, SUITE_TIME)
+    assert(signature_of(auth) == "b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500")
+}
+
+test "Signing: aws-sig-v4-test-suite post-vanilla" {
+    let auth = suite_signer().sign("POST", "/", null, suite_headers(), s3.EMPTY_SHA256, SUITE_TIME)
+    assert(signature_of(auth) == "5da7c1a2acd57cee7505fc6676e4e544621c30862966e37dddb68e92efbe5d6b")
+}
+
+test "Signing: aws-sig-v4-test-suite get-header-value-trim" {
+    let headers = suite_headers()
+    headers.set("My-Header1", " value1")
+    headers.set("My-Header2", " \"a   b   c\"")
+    let auth = suite_signer().sign("GET", "/", null, headers, s3.EMPTY_SHA256, SUITE_TIME)
+    assert(auth.contains("SignedHeaders=host;my-header1;my-header2;x-amz-date,"))
+    assert(signature_of(auth) == "acc3ed3afb60bb290fc8d2dd0098b9911fcaa05412b367055dee359757a9c736")
+}
+
+test "Signing: aws-sig-v4-test-suite post-x-www-form-urlencoded" {
+    let headers = suite_headers()
+    headers.set("Content-Type", "application/x-www-form-urlencoded")
+    let auth = suite_signer().sign("POST", "/", null, headers, s3.sha256_hex("Param1=value1"), SUITE_TIME)
+    assert(signature_of(auth) == "ff11897932ad3f4e8b18135d722051e5ac45fc38421b1da7b9d196a0fe09473a")
+}
+
+test "Signing: S3 documentation GET object" {
+    let headers = Map[String]{
+        "Host" => "examplebucket.s3.amazonaws.com"
+        "Range" => "bytes=0-9"
+        "x-amz-content-sha256" => s3.EMPTY_SHA256
+    }
+    let auth = s3_doc_signer().sign("GET", "/test.txt", null, headers, s3.EMPTY_SHA256, DOC_TIME)
+    assert(auth == "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+}
+
+test "Signing: S3 documentation PUT object" {
+    let body = "Welcome to Amazon S3."
+    let hash = s3.sha256_hex(body)
+    assert(hash == "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072")
+    let headers = Map[String]{
+        "Host" => "examplebucket.s3.amazonaws.com"
+        "Date" => "Fri, 24 May 2013 00:00:00 GMT"
+        "x-amz-storage-class" => "REDUCED_REDUNDANCY"
+        "x-amz-content-sha256" => hash
+    }
+    let auth = s3_doc_signer().sign("PUT", "/" + s3.uri_encode("test$file.text", true), null, headers, hash, DOC_TIME)
+    assert(auth.contains("SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class,"))
+    assert(signature_of(auth) == "98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd")
+}
+
+test "Signing: S3 documentation GET bucket lifecycle" {
+    let headers = Map[String]{ "Host" => "examplebucket.s3.amazonaws.com", "x-amz-content-sha256" => s3.EMPTY_SHA256 }
+    let auth = s3_doc_signer().sign("GET", "/", Map[String]{ "lifecycle" => "" }, headers, s3.EMPTY_SHA256, DOC_TIME)
+    assert(signature_of(auth) == "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543")
+}
+
+test "Signing: S3 documentation list objects" {
+    let headers = Map[String]{ "Host" => "examplebucket.s3.amazonaws.com", "x-amz-content-sha256" => s3.EMPTY_SHA256 }
+    let query = Map[String]{ "max-keys" => "2", "prefix" => "J" }
+    let auth = s3_doc_signer().sign("GET", "/", query, headers, s3.EMPTY_SHA256, DOC_TIME)
+    assert(signature_of(auth) == "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7")
+}
+
+test "Signing: S3 documentation presigned URL" {
+    let query = s3_doc_signer().presign("GET", "examplebucket.s3.amazonaws.com", "/test.txt", null, 86400, DOC_TIME)
+    assert(query == "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404")
+}
+
+// Expected values from tests/sigv4_botocore.py
+fn token_signer() s3.Signer {
+    return s3.Signer { access_key: "AKIAEXAMPLE2", secret_key: "secret/with+chars=", session_token: "session-token-123", region: "eu-west-1" }
+}
+value TOKEN_TIME (1791119109)
+
+test "Signing: botocore PUT with a session token and an encoded key" {
+    let body = "hello world"
+    let hash = s3.sha256_hex(body)
+    let headers = Map[String]{
+        "host" => "127.0.0.1:9100"
+        "x-amz-content-sha256" => hash
+        "Content-Type" => "text/plain"
+        "x-amz-meta-owner" => "ada"
+    }
+    let path = "/my-bucket/" + s3.uri_encode("dir/a b+cé.txt", true)
+    assert(path == r"/my-bucket/dir/a%20b%2Bc%C3%A9.txt")
+    let query = Map[String]{ "uploadId" => "abc/def", "partNumber" => "3" }
+    let auth = token_signer().sign("PUT", path, query, headers, hash, TOKEN_TIME)
+    assert((headers.get("x-amz-security-token") !? "") == "session-token-123")
+    assert(auth == "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE2/20261004/eu-west-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-owner;x-amz-security-token, Signature=e032b9293e2dbf60e6c0a5aa6481de0ebfbea3ba9fccc11e5ce18555bbf06044")
+}
+
+test "Signing: botocore presigned PUT with a session token" {
+    let query = token_signer().presign("PUT", "127.0.0.1:9100", "/my-bucket/dir/a%20b.txt", null, 600, TOKEN_TIME)
+    assert(query.contains("&X-Amz-Security-Token=session-token-123&"))
+    assert(query.ends_with("&X-Amz-Signature=b33df3a304898d71d07efc8370271a50ff0ddcd9bd5ccdfe7b2e7580d3c04d5f"))
+}
+
+test "Signing: sha256_hex" {
+    assert(s3.sha256_hex("") == s3.EMPTY_SHA256)
+    assert(s3.sha256_hex("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}

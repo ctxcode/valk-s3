@@ -1,0 +1,207 @@
+// Just enough XML for S3 answers: elements, text, entities and CDATA. Attributes, comments,
+// declarations and namespace prefixes are skipped.
+
+class XmlNode {
+    name: String
+    text: String ("")
+    children: Array[XmlNode] (.{})
+
+    fn child(name: String) ?XmlNode {
+        each this.children as c {
+            if c.name == name : return c
+        }
+        return null
+    }
+
+    // The text of the first child called `name`, or "" without one
+    fn text_of(name: String) String {
+        let c = this.child(name)
+        if !isset(c) : return ""
+        return c.text
+    }
+
+    fn all(name: String) Array[XmlNode] {
+        let list = Array[XmlNode]{}
+        each this.children as c {
+            if c.name == name : list.append(c)
+        }
+        return list
+    }
+}
+
+fn xml_error(message: String) !Error $throw {
+    throw .protocol { message: "Cannot read the answer of the server: " + message }
+}
+
+// The root element of `text`
+fn parse_xml(text: String) XmlNode !Error {
+    let stack = Array[XmlNode]{}
+    let root: ?XmlNode = null
+    let text_buf = ByteBuffer.new(64)
+    let len = text.length
+    let pos: uint = 0
+    while pos < len {
+        let ch = text[pos]
+        if ch != '<' {
+            let end = text.index_of_byte('<', pos) !? len
+            if stack.length > 0 : decode_entities(text, pos, end, text_buf) !>
+            pos = end
+            continue
+        }
+        if starts_at(text, pos, "<?") {
+            pos = skip_past(text, "?>", pos) !>
+            continue
+        }
+        if starts_at(text, pos, "<!--") {
+            pos = skip_past(text, "-->", pos) !>
+            continue
+        }
+        if starts_at(text, pos, "<![CDATA[") {
+            let end = text.index_of("]]>", pos) ! xml_error("unterminated CDATA")
+            text_buf.write(text.view(pos + 9, end - pos - 9))
+            pos = end + 3
+            continue
+        }
+        if starts_at(text, pos, "<!") {
+            pos = skip_past(text, ">", pos) !>
+            continue
+        }
+        if starts_at(text, pos, "</") {
+            let end = text.index_of_byte('>', pos) ! xml_error("unterminated closing tag")
+            let name = local_name(text.range(pos + 2, end - pos - 2).trim())
+            let node = stack.pop_last() ! xml_error("closing tag without an opening tag")
+            if node.name != name : xml_error("'" + name + "' closes '" + node.name + "'")
+            if node.children.length == 0 : node.text = text_buf.to_string()
+            text_buf.clear()
+            pos = end + 1
+            continue
+        }
+        // An opening tag; attributes may hold '>' inside quotes
+        let p = pos + 1
+        while p < len {
+            let c = text[p]
+            if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '/' || c == '>' : break
+            p++
+        }
+        let name = local_name(text.range(pos + 1, p - pos - 1))
+        if name.length == 0 : xml_error("a tag without a name")
+        let quote: u8 = 0
+        while p < len {
+            let c = text[p]
+            if quote != 0 {
+                if c == quote : quote = 0
+            } else if c == '"' || c == '\'' {
+                quote = c
+            } else if c == '>' {
+                break
+            }
+            p++
+        }
+        if p >= len : xml_error("unterminated tag")
+        let self_closing = text[p - 1] == '/'
+        let node = XmlNode { name: name }
+        text_buf.clear()
+        let parent = stack.last() !? null
+        if isset(parent) {
+            parent.children.append(node)
+        } else {
+            if isset(root) : xml_error("more than one root element")
+            root = node
+        }
+        if !self_closing : stack.append(node)
+        pos = p + 1
+    }
+    if stack.length > 0 : xml_error("unterminated element '" + (stack.last() !? XmlNode { name: "" }).name + "'")
+    return root ?! xml_error("no element")
+}
+
+fn skip_past(text: String, end: String, pos: uint) uint !Error {
+    let at = text.index_of(end, pos) ! xml_error("unterminated markup")
+    return at + end.length
+}
+
+// Without a namespace prefix
+fn local_name(name: String) String {
+    let colon = name.index_of_byte(':') !? name.length
+    if colon == name.length : return name
+    return name.range(colon + 1, name.length - colon - 1)
+}
+
+fn decode_entities(text: String, from: uint, to: uint, out: ByteBuffer) !Error {
+    let pos = from
+    while pos < to {
+        let amp = text.index_of_byte('&', pos) !? to
+        if amp >= to {
+            out.write(text.view(pos, to - pos))
+            return
+        }
+        out.write(text.view(pos, amp - pos))
+        let semi = text.index_of_byte(';', amp) !? to
+        if semi >= to : xml_error("unterminated entity")
+        let entity = text.range(amp + 1, semi - amp - 1)
+        if entity == "amp" {
+            out.write_byte('&')
+        } else if entity == "lt" {
+            out.write_byte('<')
+        } else if entity == "gt" {
+            out.write_byte('>')
+        } else if entity == "quot" {
+            out.write_byte('"')
+        } else if entity == "apos" {
+            out.write_byte('\'')
+        } else if entity.starts_with("#x") {
+            write_utf8(out, entity.range(2, entity.length - 2).hex_to_uint() ! xml_error("bad character reference"))
+        } else if entity.starts_with("#") {
+            write_utf8(out, entity.range(1, entity.length - 1).to_uint() ! xml_error("bad character reference"))
+        } else {
+            xml_error("unknown entity '&" + entity + ";'")
+        }
+        pos = semi + 1
+    }
+}
+
+fn write_utf8(out: ByteBuffer, cp: uint) {
+    if cp < 0x80 {
+        out.write_byte(cp.to(u8))
+    } else if cp < 0x800 {
+        out.write_byte((0xC0 | (cp >> 6)).to(u8))
+        out.write_byte((0x80 | (cp & 0x3F)).to(u8))
+    } else if cp < 0x10000 {
+        out.write_byte((0xE0 | (cp >> 12)).to(u8))
+        out.write_byte((0x80 | ((cp >> 6) & 0x3F)).to(u8))
+        out.write_byte((0x80 | (cp & 0x3F)).to(u8))
+    } else {
+        out.write_byte((0xF0 | ((cp >> 18) & 0x07)).to(u8))
+        out.write_byte((0x80 | ((cp >> 12) & 0x3F)).to(u8))
+        out.write_byte((0x80 | ((cp >> 6) & 0x3F)).to(u8))
+        out.write_byte((0x80 | (cp & 0x3F)).to(u8))
+    }
+}
+
+fn xml_escape(out: ByteBuffer, text: String) {
+    each text as ch {
+        if ch == '&' {
+            out.write("&amp;")
+        } else if ch == '<' {
+            out.write("&lt;")
+        } else if ch == '>' {
+            out.write("&gt;")
+        } else if ch == '"' {
+            out.write("&quot;")
+        } else if ch == '\'' {
+            out.write("&apos;")
+        } else if ch == '\r' {
+            out.write("&#13;")
+        } else {
+            out.write_byte(ch)
+        }
+    }
+}
+
+fn starts_at(text: String, pos: uint, part: String) bool {
+    if pos + part.length > text.length : return false
+    each part as ch, i {
+        if text[pos + i] != ch : return false
+    }
+    return true
+}

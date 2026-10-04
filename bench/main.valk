@@ -1,0 +1,64 @@
+// Upload and download throughput against the server of tests/server.sh.
+// Usage: valk build ./bench -o bench/run && ./bench/run [size_mib] [concurrency] [unsigned]
+use s3
+use valk.fs
+use valk.time
+
+fn main(args: Array[String]) {
+    let size_mib = (args.get(1) !? "256").to_uint() !? 256
+    let concurrency = (args.get(2) !? "4").to_uint() !? 4
+    let config = s3.Config {
+        endpoint: "http://127.0.0.1:9100"
+        path_style: true
+        access_key: "valktest"
+        secret_key: "valktest-secret"
+        upload_concurrency: concurrency
+        sign_payload: (args.get(3) !? "") != "unsigned"
+    }
+    let c = s3.Client.new(config) ! panic(E.message)
+    let bucket = "valk-s3-bench"
+    if !(c.bucket_exists(bucket) ! panic(E.message)) : c.create_bucket(bucket) ! panic(E.message)
+
+    let size = size_mib * 1024 * 1024
+    let path = "/tmp/valk-s3-bench.bin"
+    if (fs.size(path) !? 0) != size {
+        let buf = ByteBuffer.new(size)
+        let x: uint = 1
+        each 0 .. size {
+            x = x * 6364136223846793005 + 1442695040888963407
+            buf.write_byte((x >> 33).to(u8))
+        }
+        fs.write(path, buf) ! panic("cannot write the test file")
+    }
+
+    let t = time.mono_ms()
+    c.put_file(bucket, "big.bin", path) ! panic(E.message)
+    report("put_file", size, time.mono_ms() - t)
+
+    t = time.mono_ms()
+    c.get_file(bucket, "big.bin", "/tmp/valk-s3-bench.out") ! panic(E.message)
+    report("get_file", size, time.mono_ms() - t)
+
+    t = time.mono_ms()
+    let data = c.get_object(bucket, "big.bin") ! panic(E.message)
+    report("get_object", data.length, time.mono_ms() - t)
+
+    // Small objects, one request at a time
+    let small = "x".repeat(1024)
+    t = time.mono_ms()
+    each 0 .. 1000 as i : c.put_object(bucket, "small/" + i, small) ! panic(E.message)
+    let put_ms = time.mono_ms() - t
+    t = time.mono_ms()
+    each 0 .. 1000 as i : c.get_object(bucket, "small/" + i) ! panic(E.message)
+    let get_ms = time.mono_ms() - t
+    println("1000 x 1 KiB: put %{put_ms} ms, get %{get_ms} ms")
+
+    let same = (fs.read("/tmp/valk-s3-bench.out") !? "") == (fs.read(path) !? "x")
+    println("download matches: %{same}")
+}
+
+fn report(name: String, bytes: uint, ms: uint) {
+    let mib = bytes / (1024 * 1024)
+    let rate = ms > 0 ? bytes.to(f64) / 1048576.0 / (ms.to(f64) / 1000.0) : 0.0
+    println("%{name}: %{mib} MiB in %{ms} ms = %{rate.to_string(0)} MiB/s")
+}

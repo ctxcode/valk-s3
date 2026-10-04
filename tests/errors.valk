@@ -1,0 +1,100 @@
+use s3
+use valk.core
+
+test "Errors: wrong credentials" {
+    let config = test_config()
+    config.secret_key = "wrong"
+    let c = s3.Client.new(config) !!
+    let code = ""
+    let s3_code = ""
+    let message = ""
+    c.get_object("valk-s3-basics", "x") ! {
+        code = E.code.name()
+        s3_code = E.s3_code
+        message = E.message
+        assert(E.status == 403)
+        assert(E.request_id.length > 0)
+    }
+    assert(code == "access_denied")
+    assert(s3_code == "SignatureDoesNotMatch")
+    assert(message.starts_with("SignatureDoesNotMatch (valk-s3-basics/x): "))
+
+    // A HEAD answer has no body to read the code from
+    let head_code = ""
+    c.head_object("valk-s3-basics", "x") ! {
+        head_code = E.code.name()
+    }
+    assert(head_code == "access_denied")
+}
+
+test "Errors: missing bucket and key" {
+    let c = client()
+    let s3_code = ""
+    c.get_object("valk-s3-does-not-exist", "x") ! {
+        if E.code == E.not_found : s3_code = E.s3_code
+    }
+    assert(s3_code == "NoSuchBucket")
+    c.put_object("valk-s3-does-not-exist", "x", "1") ! {
+        if E.code == E.not_found : s3_code = "put " + E.s3_code
+    }
+    assert(s3_code == "put NoSuchBucket")
+    let bucket = fresh_bucket(c, "errors")
+    let head = ""
+    c.head_object(bucket, "missing") ! {
+        if E.code == E.not_found : head = E.s3_code
+    }
+    assert(head == "NotFound")
+    let list_missing = false
+    c.list_objects("valk-s3-does-not-exist") ! {
+        list_missing = E.code == E.not_found
+    }
+    assert(list_missing)
+}
+
+test "Errors: invalid arguments and settings" {
+    let c = client()
+    let codes = Array[String]{}
+    c.get_object("", "x") ! codes.append(E.code.name())
+    c.get_object("b", "") ! codes.append(E.code.name())
+    s3.Client.new(s3.Config { endpoint: "ftp://example.com" }) ! codes.append(E.code.name())
+    s3.Client.new(s3.Config { part_size: 1024 }) ! codes.append(E.code.name())
+    let headers = s3.PutOptions { headers: .{ "X-Bad" => "line\nbreak" } }
+    let bucket = fresh_bucket(c, "invalid")
+    c.put_object(bucket, "x", "1", headers) ! codes.append(E.code.name())
+    assert(codes.join(",") == "invalid,invalid,invalid,invalid,invalid")
+}
+
+test "Errors: connection refused" {
+    let c = s3.Client.new(s3.Config { endpoint: "http://127.0.0.1:1", path_style: true, access_key: "a", secret_key: "b" }) !!
+    let code = ""
+    c.get_object("b", "k") ! {
+        code = E.code.name()
+    }
+    assert(code == "connection")
+}
+
+test "Errors: the default AWS endpoint" {
+    let c = s3.Client.new(s3.Config { region: "eu-west-1" }) !!
+    assert(c.presign_get("my-bucket", "a b") == "https://my-bucket.s3.eu-west-1.amazonaws.com/a%20b")
+}
+
+synctest "Config: from the environment" {
+    core.setenv("AWS_ACCESS_KEY_ID", "AKIA1") _
+    core.setenv("AWS_SECRET_ACCESS_KEY", "secret1") _
+    core.setenv("AWS_SESSION_TOKEN", "token1") _
+    core.setenv("AWS_REGION", "eu-central-1") _
+    core.setenv("AWS_ENDPOINT_URL", "http://localhost:9000") _
+    let config = s3.Config.from_env()
+    core.unsetenv("AWS_ACCESS_KEY_ID") _
+    core.unsetenv("AWS_SECRET_ACCESS_KEY") _
+    core.unsetenv("AWS_SESSION_TOKEN") _
+    core.unsetenv("AWS_REGION") _
+    core.unsetenv("AWS_ENDPOINT_URL") _
+    assert(config.access_key == "AKIA1")
+    assert(config.secret_key == "secret1")
+    assert(config.session_token == "token1")
+    assert(config.region == "eu-central-1")
+    assert(config.endpoint == "http://localhost:9000")
+    let empty = s3.Config.from_env()
+    assert(empty.access_key == "" && empty.region == "us-east-1" && empty.endpoint == "")
+}

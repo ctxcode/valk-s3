@@ -1,0 +1,297 @@
+use valk.http
+use valk.io
+use valk.fs
+use valk.time
+use valk.crypto
+
+extend Client {
+    /// Stores `data` as the object `key` and returns its ETag.
+    ///
+    /// Data larger than `Config.multipart_threshold` goes up in parts.
+    ///
+    /// ```valk
+    /// client.put_object("my-bucket", "notes/today.txt", "Hello", s3.PutOptions { content_type: "text/plain" }) ! panic(E.message)
+    /// ```
+    + fn put_object(bucket: String, key: String, data: String, options: ?PutOptions (null)) String !Error {
+        check_names(bucket, key) !>
+        if data.length > this.config.multipart_threshold {
+            return this.put_parts(bucket, key, StringReader { data: data }, options, "", this.part_size_for(data.length)) !>
+        }
+        return this.put_single(bucket, key, data, options, "") !>
+    }
+
+    /// Uploads the file at `path` as the object `key` and returns its ETag.
+    ///
+    /// The content type comes from the file extension unless `options` sets one. A file larger
+    /// than `Config.multipart_threshold` goes up in parts, read one part at a time.
+    + fn put_file(bucket: String, key: String, path: String, options: ?PutOptions (null)) String !Error {
+        check_names(bucket, key) !>
+        let content_type = fs.mime_type(fs.extension(path))
+        let size = fs.size(path) ! throw .io { message: "Cannot read the file '" + path + "'" }
+        if size <= this.config.multipart_threshold {
+            let data = fs.read(path) ! throw .io { message: "Cannot read the file '" + path + "'" }
+            return this.put_single(bucket, key, data, options, content_type) !>
+        }
+        let file = fs.stream(path) ! throw .io { message: "Cannot open the file '" + path + "'" }
+        defer file.close() _
+        return this.put_parts(bucket, key, file, options, content_type, this.part_size_for(size)) !>
+    }
+
+    /// Uploads everything `reader` gives as the object `key` and returns its ETag.
+    ///
+    /// The size need not be known: up to `Config.multipart_threshold` bytes are read first, and
+    /// a longer stream goes up in parts, so memory holds a few parts at a time.
+    + fn put_stream(bucket: String, key: String, reader: io.Reader, options: ?PutOptions (null)) String !Error {
+        check_names(bucket, key) !>
+        let first = read_full(reader, this.config.multipart_threshold + 1) !>
+        if first.length <= this.config.multipart_threshold {
+            return this.put_single(bucket, key, first, options, "") !>
+        }
+        return this.put_parts(bucket, key, ChainReader { first: first, rest: reader }, options, "", this.config.part_size) !>
+    }
+
+    // The configured part size, or larger when `size` would need more than 10000 parts
+    fn part_size_for(size: uint) uint {
+        let min = (size + 9999) / 10000
+        return min > this.config.part_size ? min : this.config.part_size
+    }
+
+    fn put_single(bucket: String, key: String, data: String, options: ?PutOptions, guessed_type: String) String !Error {
+        let req = Request { method: "PUT", bucket: bucket, key: key, body: data }
+        put_headers(req.headers, options, guessed_type)
+        let res = this.call(req) !>
+        return unquote(res.headers.get("etag") !? "")
+    }
+
+    /// Returns the content of the object `key`.
+    ///
+    /// `options` can ask for a byte range. The whole object is held in memory; use
+    /// `get_object_into` or `get_file` for large ones.
+    + fn get_object(bucket: String, key: String, options: ?GetOptions (null)) String !Error {
+        check_names(bucket, key) !>
+        let req = Request { method: "GET", bucket: bucket, key: key }
+        range_header(req.headers, options)
+        // Not through `call_into`: http.Client (valk 0.7.8) does not keep a connection whose
+        // body went to an output
+        let res = this.call(req) !>
+        return res.body
+    }
+
+    /// Writes the content of the object `key` to `out` as it arrives, and returns what is known
+    /// about the object.
+    ///
+    /// When the request fails nothing is written to `out`; when the connection breaks halfway,
+    /// part of the object may have been.
+    + fn get_object_into(bucket: String, key: String, out: io.Writer, options: ?GetOptions (null)) ObjectInfo !Error {
+        check_names(bucket, key) !>
+        let req = Request { method: "GET", bucket: bucket, key: key }
+        range_header(req.headers, options)
+        let res = this.call_into(req, out) !>
+        return info_from_headers(key, res.headers)
+    }
+
+    /// Downloads the object `key` into the file at `path`, and returns what is known about the
+    /// object.
+    ///
+    /// The file is created or replaced, and removed again when the download fails.
+    + fn get_file(bucket: String, key: String, path: String, options: ?GetOptions (null)) ObjectInfo !Error {
+        check_names(bucket, key) !>
+        let file = fs.stream(path, fs.OpenOptions { write: fs.WriteMode.truncate, create: true }) ! {
+            throw .io { message: "Cannot create the file '" + path + "'" }
+        }
+        let info = this.get_object_into(bucket, key, file, options) ! {
+            file.close() _
+            fs.delete_file(path) _
+            throw E
+        }
+        file.close() ! {
+            fs.delete_file(path) _
+            throw .io { message: "Cannot write the file '" + path + "'" }
+        }
+        return info
+    }
+
+    /// Returns what is known about the object `key` without downloading it; throws `not_found`
+    /// when there is no such object.
+    + fn head_object(bucket: String, key: String) ObjectInfo !Error {
+        check_names(bucket, key) !>
+        let res = this.call(Request { method: "HEAD", bucket: bucket, key: key }) !>
+        return info_from_headers(key, res.headers)
+    }
+
+    /// Returns whether the object `key` exists.
+    + fn object_exists(bucket: String, key: String) bool !Error {
+        this.head_object(bucket, key) ! {
+            if E.code == E.not_found : return false
+            throw E
+        }
+        return true
+    }
+
+    /// Deletes the object `key`. Deleting a key that does not exist is not an error.
+    + fn delete_object(bucket: String, key: String) !Error {
+        check_names(bucket, key) !>
+        this.call(Request { method: "DELETE", bucket: bucket, key: key }) !>
+    }
+
+    /// Deletes many objects, up to 1000 per request, and returns the keys that could not be
+    /// deleted. Keys that do not exist count as deleted.
+    + fn delete_objects(bucket: String, keys: Array[String]) Array[DeleteFailure] !Error {
+        check_names(bucket, "-") !>
+        let failures = Array[DeleteFailure]{}
+        let start: uint = 0
+        while start < keys.length {
+            let count = keys.length - start
+            if count > 1000 : count = 1000
+            let body = ByteBuffer.new(count * 64 + 64)
+            body.write("<Delete><Quiet>true</Quiet>")
+            each keys.range(start, count) as key {
+                body.write("<Object><Key>")
+                xml_escape(body, key)
+                body.write("</Key></Object>")
+            }
+            body.write("</Delete>")
+            let text = body.to_string()
+            let req = Request { method: "POST", bucket: bucket, query: Map[String]{ "delete" => "" }, body: text }
+            req.headers.set("content-md5", crypto.base64_encode(crypto.hash(crypto.HashAlgorithm.md5, text)))
+            req.headers.set("content-type", "application/xml")
+            let res = this.call(req) !>
+            let root = parse_xml(res.body) !>
+            each root.all("Error") as e {
+                failures.append(DeleteFailure { key: e.text_of("Key"), code: e.text_of("Code"), message: e.text_of("Message") })
+            }
+            start += count
+        }
+        return failures
+    }
+
+    /// Copies an object inside the service, without downloading it, and returns the ETag of the
+    /// copy. Objects up to 5 GiB can be copied this way.
+    ///
+    /// The copy keeps the content type and metadata of the source, unless `options` is given:
+    /// then the copy gets those of `options` instead.
+    + fn copy_object(from_bucket: String, from_key: String, bucket: String, key: String, options: ?PutOptions (null)) String !Error {
+        check_names(from_bucket, from_key) !>
+        check_names(bucket, key) !>
+        let req = Request { method: "PUT", bucket: bucket, key: key }
+        req.headers.set("x-amz-copy-source", "/" + from_bucket + "/" + uri_encode(from_key, true))
+        if isset(options) {
+            req.headers.set("x-amz-metadata-directive", "REPLACE")
+            put_headers(req.headers, options, "")
+        }
+        let res = this.call(req) !>
+        // A copy can fail after the 200 status went out
+        let root = parse_xml(res.body) !>
+        if root.name == "Error" : throw_s3(root.text_of("Code"), root.text_of("Message"), res.status, root.text_of("RequestId"), req)
+        return unquote(root.text_of("ETag"))
+    }
+
+    /// Returns a URL that downloads the object `key` without credentials until it expires, at
+    /// most 7 days (604800 seconds) from now.
+    + fn presign_get(bucket: String, key: String, expires_seconds: uint (3600)) String {
+        return this.presign("GET", bucket, key, expires_seconds)
+    }
+
+    /// Returns a URL that uploads the object `key` with a `PUT` request without credentials
+    /// until it expires, at most 7 days (604800 seconds) from now.
+    ///
+    /// Only the host is signed, so the uploader chooses the content type and other headers.
+    + fn presign_put(bucket: String, key: String, expires_seconds: uint (3600)) String {
+        return this.presign("PUT", bucket, key, expires_seconds)
+    }
+
+    fn presign(method: String, bucket: String, key: String, expires_seconds: uint) String {
+        let host, path = this.location(bucket, key)
+        let base = this.scheme + "://" + host + path
+        if this.config.access_key.bytes == 0 : return base
+        return base + "?" + this.signer.presign(method, host, path, null, expires_seconds, time.unix_ms() / 1000)
+    }
+
+    /// Creates a bucket. In AWS regions other than `us-east-1` it is created in the client's
+    /// region. Throws `response` with `s3_code` `BucketAlreadyOwnedByYou` or
+    /// `BucketAlreadyExists` when the name is taken.
+    + fn create_bucket(bucket: String) !Error {
+        check_names(bucket, "-") !>
+        let req = Request { method: "PUT", bucket: bucket }
+        let region = this.config.region
+        if region != "us-east-1" && region != "auto" && this.config.endpoint.bytes == 0 {
+            req.body = "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>" + region + "</LocationConstraint></CreateBucketConfiguration>"
+        }
+        this.call(req) !>
+    }
+
+    /// Deletes a bucket, which must be empty.
+    + fn delete_bucket(bucket: String) !Error {
+        check_names(bucket, "-") !>
+        this.call(Request { method: "DELETE", bucket: bucket }) !>
+    }
+
+    /// Returns whether the bucket exists and the credentials may use it.
+    + fn bucket_exists(bucket: String) bool !Error {
+        check_names(bucket, "-") !>
+        this.call(Request { method: "HEAD", bucket: bucket }) ! {
+            if E.code == E.not_found : return false
+            throw E
+        }
+        return true
+    }
+
+    /// Returns the names of the buckets the credentials own.
+    + fn list_buckets() Array[String] !Error {
+        let res = this.call(Request { method: "GET" }) !>
+        let root = parse_xml(res.body) !>
+        let names = Array[String]{}
+        let buckets = root.child("Buckets")
+        if isset(buckets) {
+            each buckets.all("Bucket") as b : names.append(b.text_of("Name"))
+        }
+        return names
+    }
+}
+
+fn check_names(bucket: String, key: String) !Error {
+    if bucket.length == 0 : throw .invalid { message: "The bucket name is empty" }
+    if key.length == 0 : throw .invalid { message: "The key is empty" }
+}
+
+fn put_headers(headers: Map[String], options: ?PutOptions, guessed_type: String) {
+    let content_type = guessed_type
+    if isset(options) {
+        if options.content_type.length > 0 : content_type = options.content_type
+        each options.metadata as v, k : headers.set("x-amz-meta-" + k.lower(), v)
+        each options.headers as v, k : headers.set(k.lower(), v)
+    }
+    if content_type.length > 0 : headers.set("content-type", content_type)
+}
+
+fn range_header(headers: Map[String], options: ?GetOptions) {
+    if !isset(options) || (options.offset == 0 && options.length == 0) : return
+    let end = options.length > 0 ? (options.offset + options.length - 1).to_string() : ""
+    headers.set("range", "bytes=" + options.offset + "-" + end)
+}
+
+fn unquote(etag: String) String {
+    if etag.length >= 2 && etag[0] == '"' && etag[etag.length - 1] == '"' : return etag.range(1, etag.length - 2)
+    return etag
+}
+
+fn info_from_headers(key: String, headers: http.Headers) ObjectInfo {
+    let info = ObjectInfo { key: key }
+    each headers as value, name {
+        let n = name.lower()
+        if n == "content-length" {
+            info.size = value.to_uint() !? 0
+        } else if n == "etag" {
+            info.etag = unquote(value)
+        } else if n == "last-modified" {
+            info.last_modified = value
+        } else if n == "content-type" {
+            info.content_type = value
+        } else if n == "x-amz-storage-class" {
+            info.storage_class = value
+        } else if n.starts_with("x-amz-meta-") {
+            info.metadata.set(n.range(11, n.length - 11), value)
+        }
+    }
+    return info
+}

@@ -1,0 +1,110 @@
+extend Client {
+    /// Returns one page of the keys in `bucket`, at most 1000 (ListObjectsV2).
+    ///
+    /// ```valk
+    /// let options = s3.ListOptions { prefix: "photos/" }
+    /// while true {
+    ///     let page = client.list_objects("my-bucket", options) ! panic(E.message)
+    ///     each page.objects as obj : println(obj.key + " " + obj.size)
+    ///     if !page.truncated : break
+    ///     options.continuation_token = page.next_token
+    /// }
+    /// ```
+    + fn list_objects(bucket: String, options: ?ListOptions (null)) ListPage !Error {
+        check_names(bucket, "-") !>
+        let o = options ?? ListOptions {}
+        let query = Map[String]{ "list-type" => "2" }
+        if o.prefix.length > 0 : query.set("prefix", o.prefix)
+        if o.delimiter.length > 0 : query.set("delimiter", o.delimiter)
+        if o.max_keys != 1000 : query.set("max-keys", o.max_keys.to_string())
+        if o.continuation_token.length > 0 : query.set("continuation-token", o.continuation_token)
+        if o.start_after.length > 0 : query.set("start-after", o.start_after)
+        let res = this.call(Request { method: "GET", bucket: bucket, query: query }) !>
+        let root = parse_xml(res.body) !>
+        let page = ListPage {
+            truncated: root.text_of("IsTruncated") == "true"
+            next_token: root.text_of("NextContinuationToken")
+        }
+        each root.children as node {
+            if node.name == "Contents" {
+                page.objects.append(ObjectInfo {
+                    key: node.text_of("Key")
+                    size: node.text_of("Size").to_uint() !? 0
+                    etag: unquote(node.text_of("ETag"))
+                    last_modified: node.text_of("LastModified")
+                    storage_class: node.text_of("StorageClass")
+                })
+            } else if node.name == "CommonPrefixes" {
+                page.prefixes.append(node.text_of("Prefix"))
+            }
+        }
+        // A truncated page without a token would loop forever
+        if page.truncated && page.next_token.length == 0 {
+            throw .protocol { message: "The server sent a truncated listing without a continuation token" }
+        }
+        return page
+    }
+
+    /// Returns every key under `prefix`, reading page after page. With a `delimiter`, keys
+    /// below it are grouped into `prefixes` instead.
+    ///
+    /// Holds all keys in memory; `objects` walks a large bucket one page at a time.
+    + fn list_all(bucket: String, prefix: String (""), delimiter: String ("")) ListPage !Error {
+        let options = ListOptions { prefix: prefix, delimiter: delimiter }
+        let all = ListPage {}
+        while true {
+            let page = this.list_objects(bucket, options) !>
+            all.objects.append_many(page.objects)
+            all.prefixes.append_many(page.prefixes)
+            if !page.truncated : break
+            options.continuation_token = page.next_token
+        }
+        return all
+    }
+
+    /// Returns an iterator over the objects under `prefix`, which reads the next page when it
+    /// needs it.
+    ///
+    /// ```valk
+    /// let iter = client.objects("my-bucket", "logs/")
+    /// while true {
+    ///     let obj = iter.next() ! panic(E.message)
+    ///     if !isset(obj) : break
+    ///     println(obj.key)
+    /// }
+    /// ```
+    + fn objects(bucket: String, prefix: String ("")) ObjectIterator {
+        return ObjectIterator { client: this, bucket: bucket, options: ListOptions { prefix: prefix } }
+    }
+}
+
+/// Walks the objects of a bucket page by page; made by `Client.objects`.
++ class ObjectIterator {
+    - client: Client
+    - bucket: String
+    - options: ListOptions
+    - page: ?ListPage (null)
+    - index: uint (0)
+    - done: bool (false)
+
+    /// Returns the next object in key order, or `null` after the last one.
+    + fn next() ?ObjectInfo !Error {
+        while true {
+            let page = this.page
+            if isset(page) && this.index < page.objects.length {
+                let obj = page.objects.get(this.index) ! return null
+                this.index++
+                return obj
+            }
+            if this.done : return null
+            let next = this.client.list_objects(this.bucket, this.options) !>
+            this.page = next
+            this.index = 0
+            if next.truncated {
+                this.options.continuation_token = next.next_token
+            } else {
+                this.done = true
+            }
+        }
+    }
+}

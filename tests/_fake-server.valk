@@ -1,0 +1,82 @@
+use s3
+use valk.net
+use valk.io
+
+// A scripted HTTP server in the test process: it answers each request with the next canned
+// response and records what it got, for answers MinIO never gives
+
+class FakeResponse {
+    status: u16
+    body: String ("")
+    headers: Map[String] (.{})
+}
+
+class FakeServer {
+    listener: shared net.TcpServer
+    port: u16
+    responses: Array[FakeResponse] (.{})
+    requests: Array[String] (.{}) // method and target of each request
+
+    fn reply(status: u16, body: String ("")) FakeServer {
+        this.responses.append(FakeResponse { status: status, body: body })
+        return this
+    }
+
+    fn reply_with(status: u16, body: String, name: String, value: String) FakeServer {
+        this.responses.append(FakeResponse { status: status, body: body, headers: .{ name => value } })
+        return this
+    }
+
+    fn config() s3.Config {
+        return s3.Config { endpoint: "http://127.0.0.1:" + this.port, path_style: true, access_key: "a", secret_key: "b", timeout_ms: 5000 }
+    }
+}
+
+fn fake_server() FakeServer {
+    let listener = net.tcp_server("127.0.0.1", 0) ! panic("The fake server cannot listen")
+    let address = listener.local_address() ! panic("The fake server has no address")
+    return FakeServer { listener: listener, port: address.port }
+}
+
+// Answers every canned response on a connection of its own, then stops
+fn serve(fake: FakeServer) bool {
+    each fake.responses as res {
+        let con = fake.listener.accept(5000) ! return false
+        let request = read_request(con) ! return false
+        let first_line = request.split("\r\n").get(0) !? ""
+        fake.requests.append(first_line.range(0, first_line.length - 9))
+        let out = ByteBuffer.new()
+        out.write("HTTP/1.1 %{res.status} X\r\nConnection: close\r\nContent-Length: %{res.body.length}\r\n")
+        each res.headers as v, k : out.write(k + ": " + v + "\r\n")
+        out.write("\r\n")
+        out.write(res.body)
+        con.write(out) ! return false
+        con.close() _
+    }
+    return true
+}
+
+// The head, then a body of Content-Length bytes
+fn read_request(con: net.TcpConnection) String !io.IoError {
+    let buf = ByteBuffer.new()
+    let chunk = [u8]{ 0 x 65536 }
+    let head_end: uint = 0
+    while true {
+        head_end = buf.to_string().index_of("\r\n\r\n") !? 0
+        if head_end > 0 : break
+        let n = con.read(chunk) !>
+        if n == 0 : throw .closed
+        buf.write(chunk.view(0, n))
+    }
+    let head = buf.range(0, head_end)
+    let length: uint = 0
+    each head.split("\r\n") as line {
+        if line.lower().starts_with("content-length:") : length = line.range(15, line.length - 15).trim().to_uint() !? 0
+    }
+    while buf.length < head_end + 4 + length {
+        let n = con.read(chunk) !>
+        if n == 0 : throw .closed
+        buf.write(chunk.view(0, n))
+    }
+    return head
+}

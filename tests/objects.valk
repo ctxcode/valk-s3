@@ -1,0 +1,168 @@
+use s3
+use valk.crypto
+use valk.fs
+
+test "Objects: put, get, head, delete" {
+    let c = client()
+    defer c.close()
+    let bucket = fresh_bucket(c, "basics")
+    let etag = c.put_object(bucket, "hello.txt", "Hello world", s3.PutOptions {
+        content_type: "text/plain"
+        metadata: .{ "Owner" => "ada", "x" => "1" }
+        headers: .{ "Cache-Control" => "max-age=60" }
+    }) !!
+    assert(etag == crypto.hash_hex(crypto.HashAlgorithm.md5, "Hello world"))
+    assert((c.get_object(bucket, "hello.txt") !! ) == "Hello world")
+
+    let info = c.head_object(bucket, "hello.txt") !!
+    assert(info.key == "hello.txt")
+    assert(info.size == 11)
+    assert(info.etag == etag)
+    assert(info.content_type == "text/plain")
+    assert(info.last_modified.length > 0)
+    assert((info.metadata.get("owner") !? "") == "ada")
+    assert((info.metadata.get("x") !? "") == "1")
+    assert(c.object_exists(bucket, "hello.txt") !!)
+
+    c.delete_object(bucket, "hello.txt") !!
+    assert(!(c.object_exists(bucket, "hello.txt") !!))
+    // Deleting again is fine
+    c.delete_object(bucket, "hello.txt") !!
+}
+
+test "Objects: empty and binary content" {
+    let c = client()
+    let bucket = fresh_bucket(c, "binary")
+    c.put_object(bucket, "empty", "") !!
+    assert((c.get_object(bucket, "empty") !!) == "")
+    assert((c.head_object(bucket, "empty") !!).size == 0)
+    let data = pattern(300000)
+    c.put_object(bucket, "bin", data) !!
+    assert((c.get_object(bucket, "bin") !!) == data)
+}
+
+test "Objects: keys that need encoding" {
+    let c = client()
+    let bucket = fresh_bucket(c, "keys")
+    let keys = Array[String]{ "dir/a b+c.txt", "x&y<z>'q\".txt", "éà/日本語", "100%", "a=b?c#d;e", "~tilde_-.", "sp  aces " }
+    each keys as key {
+        c.put_object(bucket, key, "v:" + key) !!
+    }
+    let found = 0
+    each keys as key {
+        if (c.get_object(bucket, key) !? "") == "v:" + key : found++
+    }
+    assert(found == keys.length)
+    let listed = c.list_all(bucket) !!
+    assert(listed.objects.length == keys.length)
+    let matched = 0
+    each listed.objects as obj {
+        if keys.contains(obj.key) : matched++
+    }
+    assert(matched == keys.length)
+}
+
+test "Objects: ranges" {
+    let c = client()
+    let bucket = fresh_bucket(c, "ranges")
+    c.put_object(bucket, "digits", "0123456789") !!
+    assert((c.get_object(bucket, "digits", s3.GetOptions { offset: 2, length: 3 }) !!) == "234")
+    assert((c.get_object(bucket, "digits", s3.GetOptions { offset: 7 }) !!) == "789")
+    assert((c.get_object(bucket, "digits", s3.GetOptions { length: 2 }) !!) == "01")
+    let out = ByteBuffer.new()
+    let info = c.get_object_into(bucket, "digits", out, s3.GetOptions { offset: 5, length: 5 }) !!
+    assert(out.to_string() == "56789")
+    assert(info.size == 5)
+}
+
+test "Objects: streamed downloads" {
+    let c = client()
+    let bucket = fresh_bucket(c, "download")
+    let data = pattern(3 * 1024 * 1024 + 17)
+    c.put_object(bucket, "big", data) !!
+
+    let out = ByteBuffer.new()
+    let info = c.get_object_into(bucket, "big", out) !!
+    assert(out.length == data.length)
+    assert(out.to_string() == data)
+    assert(info.size == data.length)
+
+    fs.create_dir_all(tmp_dir()) _
+    let path = tmp_dir() + "/download-big.bin"
+    c.get_file(bucket, "big", path) !!
+    assert((fs.read(path) !? "") == data)
+
+    // A failed download writes nothing and leaves no file
+    let untouched = ByteBuffer.new()
+    let failed = false
+    c.get_object_into(bucket, "missing", untouched) ! {
+        failed = E.code == E.not_found && E.s3_code == "NoSuchKey"
+    }
+    assert(failed)
+    assert(untouched.length == 0)
+    let missing_path = tmp_dir() + "/download-missing.bin"
+    c.get_file(bucket, "missing", missing_path) _
+    assert(!fs.exists(missing_path))
+    fs.delete_file(path) _
+}
+
+test "Objects: copy" {
+    let c = client()
+    let bucket = fresh_bucket(c, "copy")
+    c.put_object(bucket, "src", "copy me", s3.PutOptions { content_type: "text/x-test", metadata: .{ "k" => "v" } }) !!
+    let etag = c.copy_object(bucket, "src", bucket, "dir/kept copy") !!
+    assert(etag == crypto.hash_hex(crypto.HashAlgorithm.md5, "copy me"))
+    let kept = c.head_object(bucket, "dir/kept copy") !!
+    assert(kept.content_type == "text/x-test")
+    assert((kept.metadata.get("k") !? "") == "v")
+
+    c.copy_object(bucket, "src", bucket, "replaced", s3.PutOptions { content_type: "text/plain", metadata: .{ "n" => "2" } }) !!
+    let replaced = c.head_object(bucket, "replaced") !!
+    assert(replaced.content_type == "text/plain")
+    assert(!replaced.metadata.has("k"))
+    assert((replaced.metadata.get("n") !? "") == "2")
+    assert((c.get_object(bucket, "replaced") !!) == "copy me")
+
+    let failed = false
+    c.copy_object(bucket, "nope", bucket, "x") ! {
+        failed = E.code == E.not_found
+    }
+    assert(failed)
+}
+
+test "Objects: delete many" {
+    let c = client()
+    let bucket = fresh_bucket(c, "delete-many")
+    let keys = Array[String]{}
+    each 0 .. 1005 as i {
+        let key = "k/" + i
+        keys.append(key)
+    }
+    let tasks = Array[co(bool)]{}
+    each keys as key {
+        tasks.append(co put_small(c, bucket, key))
+        if tasks.length >= 16 {
+            await (tasks.pop_first() !!)
+        }
+    }
+    each tasks as t : await t
+    assert((c.list_all(bucket, "k/") !!).objects.length == 1005)
+    keys.append("never-existed")
+    let failures = c.delete_objects(bucket, keys) !!
+    assert(failures.length == 0)
+    assert((c.list_all(bucket) !!).objects.length == 0)
+}
+
+fn put_small(c: s3.Client, bucket: String, key: String) bool {
+    c.put_object(bucket, key, "x") ! return false
+    return true
+}
+
+test "Objects: unsigned payload" {
+    let config = test_config()
+    config.sign_payload = false
+    let c = s3.Client.new(config) !!
+    let bucket = fresh_bucket(c, "unsigned")
+    c.put_object(bucket, "u", "unsigned body") !!
+    assert((c.get_object(bucket, "u") !!) == "unsigned body")
+}

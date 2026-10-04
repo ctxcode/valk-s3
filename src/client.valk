@@ -1,0 +1,259 @@
+use valk.http
+use valk.url
+use valk.io
+use valk.time
+
+// Bytes of a streamed download held back until the status is known, so an error answer
+// never reaches the caller's writer
+value HOLD_LIMIT (64 * 1024)
+
+// One request before it is signed
+class Request {
+    method: String
+    bucket: String ("")
+    key: String ("")
+    query: ?Map[String] (null)
+    headers: Map[String] (.{})
+    body: String ("")
+    output: ?io.Writer (null)
+}
+
+/// A connection to an S3-compatible service.
+///
+/// Requests to the same host share kept-alive connections. A `Client` belongs to the thread
+/// that made it; the coroutines of that thread can use it at the same time.
+///
+/// ```valk
+/// let client = s3.Client.new(s3.Config.from_env()) ! panic(E.message)
+/// client.put_object("my-bucket", "hello.txt", "Hello world") ! panic(E.message)
+/// let text = client.get_object("my-bucket", "hello.txt") ! panic(E.message)
+/// ```
++ class Client {
+    ~ config: Config
+    web: http.Client
+    signer: Signer
+    scheme: String
+    host: String
+
+    /// Returns a client for `config`. Throws `invalid` when the endpoint is not an `http` or
+    /// `https` URL.
+    + static fn new(config: Config) Client !Error {
+        let endpoint = config.endpoint.bytes > 0 ? config.endpoint : "https://s3." + config.region + ".amazonaws.com"
+        let u = url.parse(endpoint)
+        if (u.scheme != "http" && u.scheme != "https") || u.host.bytes == 0 {
+            throw .invalid { message: "The endpoint '" + endpoint + "' is not an http or https URL" }
+        }
+        if config.part_size < 5 * 1024 * 1024 {
+            throw .invalid { message: "The part size must be at least 5 MiB" }
+        }
+        let web = http.Client.new()
+        web.max_idle_per_host = config.upload_concurrency > 4 ? config.upload_concurrency : 4
+        return Client {
+            config: config
+            web: web
+            signer: Signer {
+                access_key: config.access_key
+                secret_key: config.secret_key
+                session_token: config.session_token
+                region: config.region
+            }
+            scheme: u.scheme
+            host: u.host_with_port()
+        }
+    }
+
+    /// Returns this same client: it is a handle to connections, which cannot be copied. Lets
+    /// `defer client.close()` and coroutines capture it.
+    + fn clone() SELF $clone {
+        return this
+    }
+
+    /// Closes the connections kept open; the client stays usable.
+    + fn close() {
+        this.web.close()
+    }
+
+    // The host and the encoded path of a bucket or an object
+    fn location(bucket: String, key: String) (String, String) {
+        if bucket.bytes == 0 : return (this.host, "/")
+        if this.config.path_style {
+            if key.bytes == 0 : return (this.host, "/" + bucket)
+            return (this.host, "/" + bucket + "/" + uri_encode(key, true))
+        }
+        return (bucket + "." + this.host, "/" + uri_encode(key, true))
+    }
+
+    // Signs and sends a request; any status comes back as a response
+    fn send(req: Request) http.ClientResponse !Error {
+        let host, path = this.location(req.bucket, req.key)
+        let headers = req.headers
+        headers.set("host", host)
+        let hash = req.body.length == 0 ? EMPTY_SHA256 : (this.config.sign_payload ? sha256_hex(req.body) : UNSIGNED_PAYLOAD)
+        headers.set("x-amz-content-sha256", hash)
+        if this.config.access_key.bytes > 0 {
+            let auth = this.signer.sign(req.method, path, req.query, headers, hash, time.unix_ms() / 1000)
+            headers.set("authorization", auth)
+        }
+        let target = this.scheme + "://" + host + path
+        let query = req.query
+        if isset(query) && query.length > 0 : target += "?" + canonical_query(query)
+
+        let send_headers = http.Headers.new()
+        each headers as v, k {
+            if k != "host" : send_headers.append(k, v)
+        }
+        let timeout = this.config.timeout_ms
+        let options = http.Options {
+            body: req.body
+            headers: send_headers
+            output: req.output
+            follow_redirects: false
+            decompress: false
+            timeout_ms: 0
+            connect_timeout_ms: timeout
+            read_timeout_ms: timeout
+            write_timeout_ms: timeout
+            max_response_body_size: 0
+            verify_tls_cert: this.config.verify_tls
+            ca_cert_path: this.config.ca_file
+        }
+        return this.web.request(req.method, target, options) ! {
+            if error_is(E.code, timeout) : throw .timeout { message: "%{req.method} %{target} took too long" }
+            if error_is(E.code, invalid_request) : throw .invalid { message: "%{req.method} %{target}: a header or the key cannot be sent" }
+            throw .connection { message: "%{req.method} %{target} failed: %{E.code}" }
+        }
+    }
+
+    // `send`, throwing for an error status; busy servers and broken connections are retried
+    fn call(req: Request) http.ClientResponse !Error {
+        let attempt: uint = 0
+        while true {
+            let res = this.send(req) ! {
+                if attempt < this.config.retries && (E.code == E.connection || E.code == E.timeout) {
+                    retry_pause(attempt++)
+                    continue
+                }
+                throw E
+            }
+            if (res.status == 500 || res.status == 503) && attempt < this.config.retries {
+                retry_pause(attempt++)
+                continue
+            }
+            if res.status < 200 || res.status > 299 : throw_status(res, req)
+            return res
+        }
+    }
+
+    // A streamed download into `out`; retried like `call` until data reached `out`
+    fn call_into(req: Request, out: io.Writer) http.ClientResponse !Error {
+        let attempt: uint = 0
+        while true {
+            let sink = Sink { target: out }
+            req.output = sink
+            let res = this.send(req) ! {
+                if sink.failed : throw .io { message: "Writing the download failed" }
+                if !sink.passing && attempt < this.config.retries && (E.code == E.connection || E.code == E.timeout) {
+                    retry_pause(attempt++)
+                    continue
+                }
+                throw E
+            }
+            if (res.status == 500 || res.status == 503) && attempt < this.config.retries {
+                retry_pause(attempt++)
+                continue
+            }
+            if res.status < 200 || res.status > 299 {
+                if !sink.passing : res.body = sink.held.to_string()
+                throw_status(res, req)
+            }
+            sink.finish() ! throw .io { message: "Writing the download failed" }
+            return res
+        }
+    }
+}
+
+// 100 ms, 200 ms, 400 ms, ...
+fn retry_pause(attempt: uint) {
+    time.sleep_ms(100 << (attempt < 6 ? attempt : 6))
+}
+
+// Throws the error an S3 error answer describes
+fn throw_status(res: http.ClientResponse, req: Request) !Error $throw {
+    let code = ""
+    let message = ""
+    let request_id = res.headers.get("x-amz-request-id") !? ""
+    if res.body.length > 0 {
+        let root: ?XmlNode = parse_xml(res.body) !? null
+        if isset(root) && root.name == "Error" {
+            code = root.text_of("Code")
+            message = root.text_of("Message")
+            let id = root.text_of("RequestId")
+            if id.length > 0 : request_id = id
+        }
+    }
+    throw_s3(code, message, res.status, request_id, req)
+}
+
+fn throw_s3(code: String, message: String, status: u16, request_id: String, req: Request) !Error $throw {
+    if code.length == 0 {
+        if status == 404 {
+            code = "NotFound"
+        } else if status == 403 {
+            code = "Forbidden"
+        } else {
+            code = "HTTP" + status
+        }
+    }
+    let what = req.key.length > 0 ? " (" + req.bucket + "/" + req.key + ")" : (req.bucket.length > 0 ? " (" + req.bucket + ")" : "")
+    let text = code + what + (message.length > 0 ? ": " + message : "")
+    if status == 404 || code == "NoSuchKey" || code == "NoSuchBucket" || code == "NoSuchUpload" || code == "NotFound" {
+        throw .not_found { message: text, s3_code: code, status: status, request_id: request_id }
+    }
+    if status == 403 || code == "AccessDenied" || code == "InvalidAccessKeyId" || code == "SignatureDoesNotMatch" {
+        throw .access_denied { message: text, s3_code: code, status: status, request_id: request_id }
+    }
+    throw .response { message: text, s3_code: code, status: status, request_id: request_id }
+}
+
+// Holds the start of a download back until it is clear the answer is not an error
+class Sink is io.Writer {
+    target: io.Writer
+    held: ByteBuffer (.new())
+    passing: bool (false)
+    failed: bool (false)
+
+    + fn write(data: local &[u8]) uint !io.IoError {
+        if !this.passing {
+            this.held.write(data)
+            if this.held.length < HOLD_LIMIT : return data.length
+            this.passing = true
+            this.write_out(this.held) !>
+            this.held.clear()
+            return data.length
+        }
+        this.write_out(data) !>
+        return data.length
+    }
+
+    fn finish() !io.IoError {
+        if this.passing : return
+        this.passing = true
+        this.write_out(this.held) !>
+        this.held.clear()
+    }
+
+    fn write_out(data: local &[u8]) !io.IoError {
+        let view = data
+        while view.length > 0 {
+            let n = this.target.write(view) ! {
+                this.failed = true
+                throw E
+            }
+            if n == 0 || n > view.length {
+                this.failed = true
+                throw .write
+            }
+            view = view.view(n, view.length - n)
+        }
+    }
+}

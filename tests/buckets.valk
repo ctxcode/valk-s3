@@ -1,0 +1,31 @@
+test "Buckets: create, list, delete" {
+    let c = client()
+    let bucket = "valk-s3-bucket-life"
+    if c.bucket_exists(bucket) !! {
+        let keys = Array[String]{}
+        each (c.list_all(bucket) !!).objects as obj : keys.append(obj.key)
+        c.delete_objects(bucket, keys) !!
+        c.delete_bucket(bucket) !!
+    }
+    assert(!(c.bucket_exists(bucket) !!))
+    c.create_bucket(bucket) !!
+    assert(c.bucket_exists(bucket) !!)
+    assert((c.list_buckets() !!).contains(bucket))
+
+    let code = ""
+    c.create_bucket(bucket) ! {
+        if E.code == E.response : code = E.s3_code
+    }
+    assert(code == "BucketAlreadyOwnedByYou")
+
+    c.put_object(bucket, "x", "1") !!
+    code = ""
+    c.delete_bucket(bucket) ! {
+        if E.code == E.response : code = E.s3_code
+    }
+    assert(code == "BucketNotEmpty")
+    c.delete_object(bucket, "x") !!
+    c.delete_bucket(bucket) !!
+    assert(!(c.bucket_exists(bucket) !!))
+    assert(!(c.list_buckets() !!).contains(bucket))
+}

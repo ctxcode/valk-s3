@@ -1,0 +1,99 @@
+use s3
+
+value SLOW_DOWN ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message><RequestId>R1</RequestId></Error>")
+
+test "Scripted: a busy server is retried" {
+    let fake = fake_server().reply(503, SLOW_DOWN).reply(500).reply(200, "finally")
+    let running = co serve(fake)
+    let c = s3.Client.new(fake.config()) !!
+    let body = c.get_object("b", "k") !? "failed"
+    assert(body == "finally")
+    assert(await running)
+    assert(fake.requests.length == 3)
+    assert(fake.requests.join(",") == "GET /b/k,GET /b/k,GET /b/k")
+}
+
+test "Scripted: retries give up" {
+    let fake = fake_server().reply(503, SLOW_DOWN).reply(503, SLOW_DOWN)
+    let running = co serve(fake)
+    let config = fake.config()
+    config.retries = 1
+    let c = s3.Client.new(config) !!
+    let out = ByteBuffer.new()
+    let code = ""
+    c.get_object_into("b", "k", out) ! {
+        if E.code == E.response && E.status == 503 && E.request_id == "R1" : code = E.s3_code
+    }
+    assert(code == "SlowDown")
+    assert(out.length == 0)
+    assert(await running)
+}
+
+test "Scripted: completing a multipart upload fails after the 200 status" {
+    let fake = fake_server()
+        .reply(200, "<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><UploadId>UP1</UploadId></InitiateMultipartUploadResult>")
+        .reply_with(200, "", "ETag", "\"e1\"")
+        .reply_with(200, "", "ETag", "\"e2\"")
+        .reply(200, "\n\n<Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>")
+        .reply(204)
+    let running = co serve(fake)
+    let config = fake.config()
+    config.multipart_threshold = 6 * 1024 * 1024
+    config.part_size = 5 * 1024 * 1024
+    config.upload_concurrency = 1
+    let c = s3.Client.new(config) !!
+    let code = ""
+    c.put_object("b", "k", pattern(6 * 1024 * 1024 + 1)) ! {
+        if E.code == E.response : code = E.s3_code
+    }
+    assert(code == "InternalError")
+    assert(await running)
+    assert(fake.requests.join(",") == "POST /b/k?uploads=,PUT /b/k?partNumber=1&uploadId=UP1,PUT /b/k?partNumber=2&uploadId=UP1,POST /b/k?uploadId=UP1,DELETE /b/k?uploadId=UP1")
+}
+
+test "Scripted: a copy fails after the 200 status" {
+    let fake = fake_server().reply(200, "<Error><Code>InternalError</Code><Message>copy failed</Message></Error>")
+    let running = co serve(fake)
+    let c = s3.Client.new(fake.config()) !!
+    let message = ""
+    c.copy_object("b", "a", "b", "c") ! {
+        message = E.message
+    }
+    assert(message == "InternalError (b/c): copy failed")
+    assert(await running)
+}
+
+test "Scripted: delete_objects reports failed keys" {
+    let body = "<?xml version=\"1.0\"?><!-- a comment --><s3:DeleteResult xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+        + "<s3:Error><s3:Key>a&amp;b &lt;1&gt;</s3:Key><s3:Code>AccessDenied</s3:Code><s3:Message>Access &#68;enied &#x263A;</s3:Message></s3:Error>"
+        + "<Error><Key><![CDATA[x<y]]></Key><Code>InternalError</Code><Message/></Error></s3:DeleteResult>"
+    let fake = fake_server().reply(200, body)
+    let running = co serve(fake)
+    let c = s3.Client.new(fake.config()) !!
+    let failures = c.delete_objects("b", Array[String]{ "a&b <1>", "x<y", "ok" }) !!
+    assert(await running)
+    assert(failures.length == 2)
+    let first = failures.get(0) !!
+    assert(first.key == "a&b <1>")
+    assert(first.code == "AccessDenied")
+    assert(first.message == "Access Denied ☺")
+    let second = failures.get(1) !!
+    assert(second.key == "x<y")
+    assert(second.message == "")
+}
+
+test "Scripted: answers that cannot be read" {
+    let fake = fake_server()
+        .reply(200, "<ListBucketResult><Contents><Key>a</Key></ListBucketResult>")
+        .reply(200, "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>")
+        .reply(200, "<ListBucketResult><Key>&bogus;</Key></ListBucketResult>")
+    let running = co serve(fake)
+    let config = fake.config()
+    let c = s3.Client.new(config) !!
+    let codes = Array[String]{}
+    c.list_objects("b") ! codes.append(E.code.name())
+    c.list_objects("b") ! codes.append(E.code.name())
+    c.list_objects("b") ! codes.append(E.code.name())
+    assert(codes.join(",") == "protocol,protocol,protocol")
+    assert(await running)
+}

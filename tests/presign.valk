@@ -1,0 +1,24 @@
+use valk.http
+
+test "Presign: GET and PUT without credentials" {
+    let c = client()
+    let bucket = fresh_bucket(c, "presign")
+    c.put_object(bucket, "dir/shared file.txt", "shared") !!
+
+    let url = c.presign_get(bucket, "dir/shared file.txt", 600)
+    assert(url.starts_with(TEST_ENDPOINT + "/" + bucket + "/dir/shared%20file.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&"))
+    let res = http.get(url) !!
+    assert(res.status == 200)
+    assert(res.body == "shared")
+
+    let put_url = c.presign_put(bucket, "uploaded.txt")
+    let put = http.put(put_url, "from a presigned URL") !!
+    assert(put.status == 200)
+    assert((c.get_object(bucket, "uploaded.txt") !!) == "from a presigned URL")
+
+    // The signature covers the method and the key
+    let wrong = http.put(url, "nope") !!
+    assert(wrong.status == 403)
+    let other = http.get(url.replace("shared%20file", "other")) !!
+    assert(other.status == 403)
+}

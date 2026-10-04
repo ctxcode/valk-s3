@@ -1,0 +1,70 @@
+use valk.core
+
+/// The settings of a `Client`.
+///
+/// For AWS, `region` and the keys are enough. Other S3-compatible services need their
+/// `endpoint`, and most of them `path_style`:
+///
+/// ```valk
+/// // MinIO
+/// let config = s3.Config { endpoint: "http://127.0.0.1:9000", path_style: true, access_key: "minioadmin", secret_key: "minioadmin" }
+/// // Cloudflare R2
+/// let config = s3.Config { endpoint: "https://<account-id>.r2.cloudflarestorage.com", region: "auto", access_key: key, secret_key: secret }
+/// ```
+///
+/// It holds the secret key, so keep it out of logs.
++ class Config {
+    /// The URL of the service, such as `https://nyc3.digitaloceanspaces.com`. Empty uses AWS:
+    /// `https://s3.<region>.amazonaws.com`.
+    + endpoint: String ("")
+    /// The region the requests are signed for. Services without regions, like MinIO, accept
+    /// `us-east-1`; Backblaze B2 wants its own, such as `us-west-004`, and R2 wants `auto`.
+    + region: String ("us-east-1")
+    /// The access key id; empty sends requests unsigned.
+    + access_key: String ("")
+    /// The secret access key.
+    + secret_key: String ("")
+    /// The token of temporary credentials, such as those of an AWS role.
+    + session_token: String ("")
+    /// Puts the bucket in the path (`endpoint/bucket/key`) instead of in the host name
+    /// (`bucket.endpoint/key`). MinIO and most self-hosted services need it.
+    + path_style: bool (false)
+    /// Whether the body of an upload is part of the signature. Off sends `UNSIGNED-PAYLOAD`,
+    /// which saves hashing the body; only do that over HTTPS.
+    + sign_payload: bool (true)
+    /// Uploads larger than this go in parts (multipart upload), at most 5 GiB.
+    + multipart_threshold: uint (16 * 1024 * 1024)
+    /// The size of each part of a multipart upload, at least 5 MiB. An upload has at most
+    /// 10000 parts: `put_object` and `put_file` use larger parts when they need to, and
+    /// `put_stream` stops at 10000 parts, about 78 GiB with the default.
+    + part_size: uint (8 * 1024 * 1024)
+    /// How many parts of one multipart upload are sent at the same time.
+    + upload_concurrency: uint (4)
+    /// How often a request is tried again when the connection fails or the server answers
+    /// 500 or 503 (`SlowDown`), with a pause that doubles from 100 ms.
+    + retries: uint (2)
+    /// How long connecting, and each read and write on the connection, may take, in
+    /// milliseconds.
+    + timeout_ms: uint (30000)
+    /// Whether the TLS certificate of the server is checked.
+    + verify_tls: bool (true)
+    /// A PEM file with the certificate authority to check the server against, for a
+    /// self-signed certificate.
+    + ca_file: ?String (null)
+
+    /// Returns the settings from the standard AWS environment variables.
+    ///
+    /// Reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`
+    /// (or `AWS_DEFAULT_REGION`) and `AWS_ENDPOINT_URL_S3` (or `AWS_ENDPOINT_URL`). Variables
+    /// that are not set keep the defaults; without keys, requests go out unsigned, which
+    /// public buckets accept.
+    + static fn from_env() Config {
+        let config = Config {}
+        config.access_key = core.getenv("AWS_ACCESS_KEY_ID") !? ""
+        config.secret_key = core.getenv("AWS_SECRET_ACCESS_KEY") !? ""
+        config.session_token = core.getenv("AWS_SESSION_TOKEN") !? ""
+        config.region = core.getenv("AWS_REGION") !? (core.getenv("AWS_DEFAULT_REGION") !? "us-east-1")
+        config.endpoint = core.getenv("AWS_ENDPOINT_URL_S3") !? (core.getenv("AWS_ENDPOINT_URL") !? "")
+        return config
+    }
+}

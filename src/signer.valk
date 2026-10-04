@@ -1,0 +1,239 @@
+use valk.crypto
+
+value ALGORITHM ("AWS4-HMAC-SHA256")
+/// The payload hash of a request whose body is not signed.
++ value UNSIGNED_PAYLOAD ("UNSIGNED-PAYLOAD")
+
+class Pair {
+    name: String
+    value: String
+}
+
+/// Signs requests with AWS Signature Version 4, in an `Authorization` header or in the query
+/// string of a presigned URL.
+///
+/// `Client` signs its own requests; a `Signer` is for requests sent another way.
+///
+/// ```valk
+/// let signer = s3.Signer { access_key: "AKIA...", secret_key: "...", region: "eu-west-1" }
+/// let headers = Map[String]{ "host" => "my-bucket.s3.eu-west-1.amazonaws.com", "x-amz-content-sha256" => s3.EMPTY_SHA256 }
+/// let auth = signer.sign("GET", "/photo.jpg", null, headers, s3.EMPTY_SHA256, time.unix_ms() / 1000)
+/// ```
++ class Signer {
+    + access_key: String
+    + secret_key: String
+    /// The token of temporary credentials; sent as `x-amz-security-token` when set.
+    + session_token: String ("")
+    + region: String ("us-east-1")
+    + service: String ("s3")
+    - key_scope: String ("")
+    - key: String ("")
+
+    /// Returns the `Authorization` header value for a request.
+    ///
+    /// `path` is the URI-encoded path as sent (see `uri_encode`), `query` the decoded query
+    /// parameters, and `headers` the headers to sign, with at least `host`. `x-amz-date`, and
+    /// `x-amz-security-token` when there is a session token, are added to `headers`, so send
+    /// all of them. `payload_hash` is the hex SHA-256 of the body (see `sha256_hex`) or
+    /// `UNSIGNED_PAYLOAD`.
+    + fn sign(method: String, path: String, query: ?Map[String], headers: Map[String], payload_hash: String, unix_seconds: uint) String {
+        let date = amz_date(unix_seconds)
+        headers.set("x-amz-date", date)
+        if this.session_token.bytes > 0 : headers.set("x-amz-security-token", this.session_token)
+        let signed = signed_header_names(headers)
+        let canonical = this.canonical_request(method, path, query, headers, payload_hash)
+        let signature = this.signature(date, canonical)
+        return ALGORITHM + " Credential=" + this.access_key + "/" + this.scope(date) + ", SignedHeaders=" + signed + ", Signature=" + signature
+    }
+
+    /// Returns the query string of a presigned URL, signature included, without the `?`.
+    ///
+    /// Only `host` is signed, so whoever holds the URL may send any other header with it.
+    /// `query` holds parameters of the request itself, such as `response-content-type`.
+    + fn presign(method: String, host: String, path: String, query: ?Map[String], expires_seconds: uint, unix_seconds: uint) String {
+        let date = amz_date(unix_seconds)
+        let params = Map[String]{}
+        if isset(query) {
+            each query as v, k : params.set(k, v)
+        }
+        params.set("X-Amz-Algorithm", ALGORITHM)
+        params.set("X-Amz-Credential", this.access_key + "/" + this.scope(date))
+        params.set("X-Amz-Date", date)
+        params.set("X-Amz-Expires", expires_seconds.to_string())
+        params.set("X-Amz-SignedHeaders", "host")
+        if this.session_token.bytes > 0 : params.set("X-Amz-Security-Token", this.session_token)
+        let headers = Map[String]{ "host" => host }
+        let canonical = this.canonical_request(method, path, params, headers, UNSIGNED_PAYLOAD)
+        let signature = this.signature(date, canonical)
+        return canonical_query(params) + "&X-Amz-Signature=" + signature
+    }
+
+    /// Returns the canonical request the signature is computed over; for comparing with what a
+    /// server reports when it rejects a signature.
+    + fn canonical_request(method: String, path: String, query: ?Map[String], headers: Map[String], payload_hash: String) String {
+        let out = ByteBuffer.new(256)
+        out.write(method)
+        out.write_byte('\n')
+        out.write(path.bytes > 0 ? path : "/")
+        out.write_byte('\n')
+        if isset(query) : out.write(canonical_query(query))
+        out.write_byte('\n')
+        each sorted_headers(headers) as h {
+            out.write(h.name)
+            out.write_byte(':')
+            out.write(h.value)
+            out.write_byte('\n')
+        }
+        out.write_byte('\n')
+        out.write(signed_header_names(headers))
+        out.write_byte('\n')
+        out.write(payload_hash)
+        return out.to_string()
+    }
+
+    - fn scope(date: String) String {
+        return date.range(0, 8) + "/" + this.region + "/" + this.service + "/aws4_request"
+    }
+
+    - fn signature(date: String, canonical: String) String {
+        let scope = this.scope(date)
+        let to_sign = ALGORITHM + "\n" + date + "\n" + scope + "\n" + crypto.hash_hex(crypto.HashAlgorithm.sha256, canonical)
+        return crypto.Hmac.sign_hex(crypto.HashAlgorithm.sha256, this.signing_key(scope), to_sign)
+    }
+
+    // The derived key only changes with the day, so it is kept
+    - fn signing_key(scope: String) String {
+        if scope == this.key_scope : return this.key
+        let alg = crypto.HashAlgorithm.sha256
+        let k = crypto.Hmac.sign(alg, "AWS4" + this.secret_key, scope.range(0, 8))
+        k = crypto.Hmac.sign(alg, k, this.region)
+        k = crypto.Hmac.sign(alg, k, this.service)
+        k = crypto.Hmac.sign(alg, k, "aws4_request")
+        this.key_scope = scope
+        this.key = k
+        return k
+    }
+}
+
+/// Returns `text` percent-encoded the way AWS signatures expect: everything but `A-Z a-z 0-9
+/// - . _ ~` becomes `%XX`, and `/` too unless `keep_slash` is set, as for an object key in a path.
++ fn uri_encode(text: String, keep_slash: bool (false)) String {
+    let clean = true
+    each text as ch {
+        if !is_unreserved(ch) && !(keep_slash && ch == '/') {
+            clean = false
+            break
+        }
+    }
+    if clean : return text
+    let hex = "0123456789ABCDEF"
+    let out = ByteBuffer.new(text.bytes + 16)
+    each text as ch {
+        if is_unreserved(ch) || (keep_slash && ch == '/') {
+            out.write_byte(ch)
+        } else {
+            out.write_byte('%')
+            out.write_byte(hex[ch >> 4])
+            out.write_byte(hex[ch & 15])
+        }
+    }
+    return out.to_string()
+}
+
+fn is_unreserved(ch: u8) bool {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.' || ch == '_' || ch == '~'
+}
+
+/// Returns the time as `x-amz-date` writes it: `20130524T000000Z`.
++ fn amz_date(unix_seconds: uint) String {
+    let days = unix_seconds / 86400
+    let secs = unix_seconds % 86400
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm)
+    let z = days + 719468
+    let era = z / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let day = doy - (153 * mp + 2) / 5 + 1
+    let month = mp < 10 ? mp + 3 : mp - 9
+    let year = yoe + era * 400
+    if month <= 2 : year++
+    let out = ByteBuffer.new(16)
+    pad(out, year, 4)
+    pad(out, month, 2)
+    pad(out, day, 2)
+    out.write_byte('T')
+    pad(out, secs / 3600, 2)
+    pad(out, secs / 60 % 60, 2)
+    pad(out, secs % 60, 2)
+    out.write_byte('Z')
+    return out.to_string()
+}
+
+fn pad(out: ByteBuffer, v: uint, width: uint) {
+    let digits: uint = 1
+    let x = v
+    while x >= 10 {
+        x /= 10
+        digits++
+    }
+    while digits < width {
+        out.write_byte('0')
+        digits++
+    }
+    out.write_uint_ascii(v)
+}
+
+/// Returns the query parameters encoded and sorted as a signature expects; also a valid query
+/// string to send.
++ fn canonical_query(query: Map[String]) String {
+    let pairs = Array[Pair]{}
+    each query as v, k : pairs.append(Pair { name: uri_encode(k), value: uri_encode(v) })
+    pairs.sort(fn(a: Pair, b: Pair) bool {
+        if a.name == b.name : return a.value > b.value
+        return a.name > b.name
+    })
+    let out = ByteBuffer.new(64)
+    each pairs as p, i {
+        if i > 0 : out.write_byte('&')
+        out.write(p.name)
+        out.write_byte('=')
+        out.write(p.value)
+    }
+    return out.to_string()
+}
+
+fn sorted_headers(headers: Map[String]) Array[Pair] {
+    let pairs = Array[Pair]{}
+    each headers as v, k : pairs.append(Pair { name: k.lower(), value: canonical_header_value(v) })
+    pairs.sort(fn(a: Pair, b: Pair) bool { return a.name > b.name })
+    return pairs
+}
+
+fn signed_header_names(headers: Map[String]) String {
+    let out = ByteBuffer.new(64)
+    each sorted_headers(headers) as h, i {
+        if i > 0 : out.write_byte(';')
+        out.write(h.name)
+    }
+    return out.to_string()
+}
+
+// Trimmed, with runs of spaces inside collapsed to one
+fn canonical_header_value(value: String) String {
+    let v = value.trim()
+    if !v.contains("  ") : return v
+    let out = ByteBuffer.new(v.bytes)
+    let space = false
+    each v as ch {
+        if ch == ' ' {
+            if space : continue
+            space = true
+        } else {
+            space = false
+        }
+        out.write_byte(ch)
+    }
+    return out.to_string()
+}

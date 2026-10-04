@@ -1,0 +1,162 @@
+use valk.io
+use valk.mem
+
+// What one part upload ended with; coroutine errors cannot carry a payload
+class PartResult {
+    number: uint
+    etag: String ("")
+    failed: bool (false)
+    kind: String ("")
+    message: String ("")
+    s3_code: String ("")
+    status: u16 (0)
+    request_id: String ("")
+}
+
+extend Client {
+    // A multipart upload of everything `reader` gives
+    fn put_parts(bucket: String, key: String, reader: io.Reader, options: ?PutOptions, guessed_type: String, part_size: uint) String !Error {
+        let req = Request { method: "POST", bucket: bucket, key: key, query: Map[String]{ "uploads" => "" } }
+        put_headers(req.headers, options, guessed_type)
+        let res = this.call(req) !>
+        let root = parse_xml(res.body) !>
+        let upload_id = root.text_of("UploadId")
+        if upload_id.length == 0 : throw .protocol { message: "The server started a multipart upload without an upload id" }
+        return this.send_parts(bucket, key, upload_id, reader, part_size) ! {
+            this.abort_upload(bucket, key, upload_id) _
+            throw E
+        }
+    }
+
+    fn send_parts(bucket: String, key: String, upload_id: String, reader: io.Reader, part_size: uint) String !Error {
+        let concurrency = this.config.upload_concurrency > 0 ? this.config.upload_concurrency : 1
+        let tasks = Array[co(PartResult)]{}
+        let etags = Array[String]{}
+        let failure: ?PartResult = null
+        let read_failed = false
+        let number: uint = 0
+        while true {
+            let data = read_full(reader, part_size) ! {
+                read_failed = true
+                break
+            }
+            if data.length == 0 && number > 0 : break
+            number++
+            if number > 10000 {
+                failure = PartResult { number: number, failed: true, kind: "invalid", message: "More than 10000 parts; raise Config.part_size" }
+                break
+            }
+            tasks.append(co this.upload_part(bucket, key, upload_id, number, data))
+            if tasks.length >= concurrency {
+                let task = tasks.pop_first() ! break
+                let result = await task
+                if result.failed {
+                    failure = result
+                    break
+                }
+                etags.append(result.etag)
+            }
+            if data.length < part_size : break
+        }
+        // Every started part is awaited, also after a failure
+        each tasks as task {
+            let result = await task
+            if result.failed && !isset(failure) : failure = result
+            etags.append(result.etag)
+        }
+        if isset(failure) : throw_part(failure)
+        if read_failed : throw .io { message: "Reading the data to upload failed" }
+
+        let body = ByteBuffer.new(etags.length * 80 + 64)
+        body.write("<CompleteMultipartUpload>")
+        each etags as etag, i {
+            body.write("<Part><PartNumber>")
+            body.write_uint_ascii(i + 1)
+            body.write("</PartNumber><ETag>")
+            xml_escape(body, etag)
+            body.write("</ETag></Part>")
+        }
+        body.write("</CompleteMultipartUpload>")
+        let req = Request { method: "POST", bucket: bucket, key: key, query: Map[String]{ "uploadId" => upload_id }, body: body.to_string() }
+        req.headers.set("content-type", "application/xml")
+        let res = this.call(req) !>
+        // Completing can fail after the 200 status went out
+        let root = parse_xml(res.body) !>
+        if root.name == "Error" : throw_s3(root.text_of("Code"), root.text_of("Message"), res.status, root.text_of("RequestId"), req)
+        return unquote(root.text_of("ETag"))
+    }
+
+    fn upload_part(bucket: String, key: String, upload_id: String, number: uint, data: String) PartResult {
+        let query = Map[String]{ "partNumber" => number.to_string(), "uploadId" => upload_id }
+        let res = this.call(Request { method: "PUT", bucket: bucket, key: key, query: query, body: data }) ! {
+            return PartResult { number: number, failed: true, kind: E.code.name(), message: E.message, s3_code: E.s3_code, status: E.status, request_id: E.request_id }
+        }
+        return PartResult { number: number, etag: res.headers.get("etag") !? "" }
+    }
+
+    fn abort_upload(bucket: String, key: String, upload_id: String) !Error {
+        this.call(Request { method: "DELETE", bucket: bucket, key: key, query: Map[String]{ "uploadId" => upload_id } }) !>
+    }
+}
+
+fn throw_part(r: PartResult) !Error $throw {
+    let message = "Part %{r.number}: " + r.message
+    if r.kind == "not_found" : throw .not_found { message: message, s3_code: r.s3_code, status: r.status, request_id: r.request_id }
+    if r.kind == "access_denied" : throw .access_denied { message: message, s3_code: r.s3_code, status: r.status, request_id: r.request_id }
+    if r.kind == "connection" : throw .connection { message: message }
+    if r.kind == "timeout" : throw .timeout { message: message }
+    if r.kind == "invalid" : throw .invalid { message: message }
+    if r.kind == "protocol" : throw .protocol { message: message }
+    if r.kind == "io" : throw .io { message: message }
+    throw .response { message: message, s3_code: r.s3_code, status: r.status, request_id: r.request_id }
+}
+
+// Up to `max` bytes, fewer only at the end of the stream
+fn read_full(reader: io.Reader, max: uint) String !Error {
+    let buf = ByteBuffer.new(max < 1024 * 1024 ? max : 1024 * 1024)
+    while buf.length < max {
+        let want = max - buf.length
+        if want > 1024 * 1024 : want = 1024 * 1024
+        buf.reserve(want)
+        let n = reader.read(buf.view_spare(want)) ! {
+            if error_is(E.code, closed) : break
+            throw .io { message: "Reading the data to upload failed" }
+        }
+        if n == 0 : break
+        buf.skip(n)
+    }
+    return buf.into_string()
+}
+
+class StringReader is io.Reader {
+    data: String
+    pos: uint (0)
+
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        let n = this.data.length - this.pos
+        if n > buf.length : n = buf.length
+        @unsafe
+        mem.copy_bytes(this.data.data.@offset(this.pos), buf.data, n)
+        this.pos += n
+        return n
+    }
+}
+
+// `first`, then the rest of `rest`
+class ChainReader is io.Reader {
+    first: String
+    rest: io.Reader
+    pos: uint (0)
+
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        if this.pos < this.first.length {
+            let n = this.first.length - this.pos
+            if n > buf.length : n = buf.length
+            @unsafe
+            mem.copy_bytes(this.first.data.@offset(this.pos), buf.data, n)
+            this.pos += n
+            return n
+        }
+        return this.rest.read(buf) !>
+    }
+}
