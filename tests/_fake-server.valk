@@ -12,7 +12,7 @@ class FakeResponse {
 }
 
 class FakeServer {
-    listener: shared net.TcpServer
+    listener: atomic net.TcpServer
     port: u16
     responses: Array[FakeResponse] (.{})
     requests: Array[String] (.{}) // method and target of each request

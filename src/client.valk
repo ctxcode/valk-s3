@@ -64,7 +64,7 @@ class Request {
 
     /// Returns this same client: it is a handle to connections, which cannot be copied. Lets
     /// `defer client.close()` and coroutines capture it.
-    + fn clone() SELF $clone {
+    + fn clone() SELF {
         return this
     }
 
