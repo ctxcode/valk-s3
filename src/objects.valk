@@ -27,12 +27,12 @@ extend Client {
     + fn put_file(bucket: String, key: String, path: String, options: ?PutOptions (null)) String !Error {
         check_names(bucket, key) !>
         let content_type = fs.mime_type(fs.extension(path))
-        let size = fs.size(path) ! throw .io { message: "Cannot read the file '" + path + "'" }
+        let size = fs.size(path) ! throw .io("Cannot read the file '" + path + "'")
         if size <= this.config.multipart_threshold {
-            let data = fs.read(path) ! throw .io { message: "Cannot read the file '" + path + "'" }
+            let data = fs.read(path) ! throw .io("Cannot read the file '" + path + "'")
             return this.put_single(bucket, key, data, options, content_type) !>
         }
-        let file = fs.stream(path) ! throw .io { message: "Cannot open the file '" + path + "'" }
+        let file = fs.stream(path) ! throw .io("Cannot open the file '" + path + "'")
         defer file.close() _
         return this.put_parts(bucket, key, file, options, content_type, this.part_size_for(size)) !>
     }
@@ -97,7 +97,7 @@ extend Client {
     + fn get_file(bucket: String, key: String, path: String, options: ?GetOptions (null)) ObjectInfo !Error {
         check_names(bucket, key) !>
         let file = fs.stream(path, fs.OpenOptions { write: fs.WriteMode.truncate, create: true }) ! {
-            throw .io { message: "Cannot create the file '" + path + "'" }
+            throw .io("Cannot create the file '" + path + "'")
         }
         let info = this.get_object_into(bucket, key, file, options) ! {
             file.close() _
@@ -106,7 +106,7 @@ extend Client {
         }
         file.close() ! {
             fs.delete_file(path) _
-            throw .io { message: "Cannot write the file '" + path + "'" }
+            throw .io("Cannot write the file '" + path + "'")
         }
         return info
     }
@@ -122,7 +122,7 @@ extend Client {
     /// Returns whether the object `key` exists.
     + fn object_exists(bucket: String, key: String) bool !Error {
         this.head_object(bucket, key) ! {
-            if E.code == E.not_found : return false
+            if E is .not_found : return false
             throw E
         }
         return true
@@ -230,7 +230,7 @@ extend Client {
     + fn bucket_exists(bucket: String) bool !Error {
         check_names(bucket, "-") !>
         this.call(Request { method: "HEAD", bucket: bucket }) ! {
-            if E.code == E.not_found : return false
+            if E is .not_found : return false
             throw E
         }
         return true
@@ -250,8 +250,8 @@ extend Client {
 }
 
 fn check_names(bucket: String, key: String) !Error {
-    if bucket.length == 0 : throw .invalid { message: "The bucket name is empty" }
-    if key.length == 0 : throw .invalid { message: "The key is empty" }
+    if bucket.length == 0 : throw .invalid("The bucket name is empty")
+    if key.length == 0 : throw .invalid("The key is empty")
 }
 
 fn put_headers(headers: Map[String], options: ?PutOptions, guessed_type: String) {

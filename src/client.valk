@@ -41,10 +41,10 @@ class Request {
         let endpoint = config.endpoint.bytes > 0 ? config.endpoint : "https://s3." + config.region + ".amazonaws.com"
         let u = url.parse(endpoint)
         if (u.scheme != "http" && u.scheme != "https") || u.host.bytes == 0 {
-            throw .invalid { message: "The endpoint '" + endpoint + "' is not an http or https URL" }
+            throw .invalid("The endpoint '" + endpoint + "' is not an http or https URL")
         }
         if config.part_size < 5 * 1024 * 1024 {
-            throw .invalid { message: "The part size must be at least 5 MiB" }
+            throw .invalid("The part size must be at least 5 MiB")
         }
         let web = http.Client.new()
         web.max_idle_per_host = config.upload_concurrency > 4 ? config.upload_concurrency : 4
@@ -118,9 +118,9 @@ class Request {
             ca_cert_path: this.config.ca_file
         }
         return this.web.request(req.method, target, options) ! {
-            if error_is(E.code, timeout) : throw .timeout { message: "%{req.method} %{target} took too long" }
-            if error_is(E.code, invalid_request) : throw .invalid { message: "%{req.method} %{target}: a header or the key cannot be sent" }
-            throw .connection { message: "%{req.method} %{target} failed: %{E.code}" }
+            if E.io_error() is .timeout : throw .timeout("%{req.method} %{target} took too long")
+            if E is .invalid_request : throw .invalid("%{req.method} %{target}: a header or the key cannot be sent")
+            throw .connection("%{req.method} %{target} failed: %{E}")
         }
     }
 
@@ -129,7 +129,7 @@ class Request {
         let attempt: uint = 0
         while true {
             let res = this.send(req) ! {
-                if attempt < this.config.retries && (E.code == E.connection || E.code == E.timeout) {
+                if attempt < this.config.retries && (E is .connection || E is .timeout) {
                     retry_pause(attempt++)
                     continue
                 }
@@ -151,8 +151,8 @@ class Request {
             let sink = Sink { target: out }
             req.output = sink
             let res = this.send(req) ! {
-                if sink.failed : throw .io { message: "Writing the download failed" }
-                if !sink.passing && attempt < this.config.retries && (E.code == E.connection || E.code == E.timeout) {
+                if sink.failed : throw .io("Writing the download failed")
+                if !sink.passing && attempt < this.config.retries && (E is .connection || E is .timeout) {
                     retry_pause(attempt++)
                     continue
                 }
@@ -166,7 +166,7 @@ class Request {
                 if !sink.passing : res.body = sink.held.to_string()
                 throw_status(res, req)
             }
-            sink.finish() ! throw .io { message: "Writing the download failed" }
+            sink.finish() ! throw .io("Writing the download failed")
             return res
         }
     }
@@ -207,12 +207,12 @@ fn throw_s3(code: String, message: String, status: u16, request_id: String, req:
     let what = req.key.length > 0 ? " (" + req.bucket + "/" + req.key + ")" : (req.bucket.length > 0 ? " (" + req.bucket + ")" : "")
     let text = code + what + (message.length > 0 ? ": " + message : "")
     if status == 404 || code == "NoSuchKey" || code == "NoSuchBucket" || code == "NoSuchUpload" || code == "NotFound" {
-        throw .not_found { message: text, s3_code: code, status: status, request_id: request_id }
+        throw .not_found(text, code, status, request_id)
     }
     if status == 403 || code == "AccessDenied" || code == "InvalidAccessKeyId" || code == "SignatureDoesNotMatch" {
-        throw .access_denied { message: text, s3_code: code, status: status, request_id: request_id }
+        throw .access_denied(text, code, status, request_id)
     }
-    throw .response { message: text, s3_code: code, status: status, request_id: request_id }
+    throw .response(text, code, status, request_id)
 }
 
 // Holds the start of a download back until it is clear the answer is not an error

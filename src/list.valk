@@ -40,7 +40,7 @@ extend Client {
         }
         // A truncated page without a token would loop forever
         if page.truncated && page.next_token.length == 0 {
-            throw .protocol { message: "The server sent a truncated listing without a continuation token" }
+            throw .protocol("The server sent a truncated listing without a continuation token")
         }
         return page
     }

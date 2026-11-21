@@ -1,20 +1,70 @@
 /// Thrown by every operation of this package.
 ///
-/// - `not_found`: the bucket or the object does not exist (`NoSuchKey`, `NoSuchBucket`, or a
-///   404 answer without a body).
-/// - `access_denied`: the credentials are wrong, or not allowed to do this (403).
-/// - `response`: the server answered with any other error; `s3_code` says which.
-/// - `connection`: the server could not be reached, or the connection broke.
-/// - `timeout`: the server did not answer in time.
-/// - `io`: reading the local file or stream, or writing the output, failed.
-/// - `invalid`: an argument or the settings cannot be used, such as an empty bucket name.
-/// - `protocol`: the server sent an answer this package cannot read.
+/// - `not_found(message, s3_code, status, request_id)`: the bucket or the object does not exist
+///   (`NoSuchKey`, `NoSuchBucket`, or a 404 answer without a body).
+/// - `access_denied(message, s3_code, status, request_id)`: the credentials are wrong, or not
+///   allowed to do this (403).
+/// - `response(message, s3_code, status, request_id)`: the server answered with any other error;
+///   `s3_code` says which.
+/// - `connection(message)`: the server could not be reached, or the connection broke.
+/// - `timeout(message)`: the server did not answer in time.
+/// - `io(message)`: reading the local file or stream, or writing the output, failed.
+/// - `invalid(message)`: an argument or the settings cannot be used, such as an empty bucket name.
+/// - `protocol(message)`: the server sent an answer this package cannot read.
 ///
 /// `s3_code` holds the error code the server sent, such as `NoSuchKey` or `SlowDown`, `status`
 /// the HTTP status, and `request_id` the id the server gave the request, for its logs.
-+ error Error (not_found, access_denied, response, connection, timeout, io, invalid, protocol) payload {
-    message: String
-    s3_code: String ("")
-    status: u16 (0)
-    request_id: String ("")
++ union Error {
+    not_found(String, String, u16, String)
+    access_denied(String, String, u16, String)
+    response(String, String, u16, String)
+    connection(String)
+    timeout(String)
+    io(String)
+    invalid(String)
+    protocol(String)
+
+    + get message: String {
+        return match this : String {
+            .not_found(msg, _, _, _) => msg
+            .access_denied(msg, _, _, _) => msg
+            .response(msg, _, _, _) => msg
+            .connection(msg) => msg
+            .timeout(msg) => msg
+            .io(msg) => msg
+            .invalid(msg) => msg
+            .protocol(msg) => msg
+        }
+    }
+
+    + get s3_code: String {
+        return match this : String {
+            .not_found(_, code, _, _) => code
+            .access_denied(_, code, _, _) => code
+            .response(_, code, _, _) => code
+            default => ""
+        }
+    }
+
+    + get status: u16 {
+        return match this : u16 {
+            .not_found(_, _, status, _) => status
+            .access_denied(_, _, status, _) => status
+            .response(_, _, status, _) => status
+            default => 0
+        }
+    }
+
+    + get request_id: String {
+        return match this : String {
+            .not_found(_, _, _, id) => id
+            .access_denied(_, _, _, id) => id
+            .response(_, _, _, id) => id
+            default => ""
+        }
+    }
+
+    + fn to_string() String $auto {
+        return this.message
+    }
 }

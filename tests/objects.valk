@@ -96,7 +96,7 @@ test "Objects: streamed downloads" {
     let untouched = ByteBuffer.new()
     let failed = false
     c.get_object_into(bucket, "missing", untouched) ! {
-        failed = E.code == E.not_found && E.s3_code == "NoSuchKey"
+        failed = E is .not_found && E.s3_code == "NoSuchKey"
     }
     assert(failed)
     assert(untouched.length == 0)
@@ -125,7 +125,7 @@ test "Objects: copy" {
 
     let failed = false
     c.copy_object(bucket, "nope", bucket, "x") ! {
-        failed = E.code == E.not_found
+        failed = E is .not_found
     }
     assert(failed)
 }

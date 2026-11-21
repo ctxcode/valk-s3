@@ -22,7 +22,7 @@ test "Scripted: retries give up" {
     let out = ByteBuffer.new()
     let code = ""
     c.get_object_into("b", "k", out) ! {
-        if E.code == E.response && E.status == 503 && E.request_id == "R1" : code = E.s3_code
+        if E is .response && E.status == 503 && E.request_id == "R1" : code = E.s3_code
     }
     assert(code == "SlowDown")
     assert(out.length == 0)
@@ -44,7 +44,7 @@ test "Scripted: completing a multipart upload fails after the 200 status" {
     let c = s3.Client.new(config) !!
     let code = ""
     c.put_object("b", "k", pattern(6 * 1024 * 1024 + 1)) ! {
-        if E.code == E.response : code = E.s3_code
+        if E is .response : code = E.s3_code
     }
     assert(code == "InternalError")
     assert(await running)
@@ -90,10 +90,10 @@ test "Scripted: answers that cannot be read" {
     let running = co serve(fake)
     let config = fake.config()
     let c = s3.Client.new(config) !!
-    let codes = Array[String]{}
-    c.list_objects("b") ! codes.append(E.code.name())
-    c.list_objects("b") ! codes.append(E.code.name())
-    c.list_objects("b") ! codes.append(E.code.name())
-    assert(codes.join(",") == "protocol,protocol,protocol")
+    let count: uint = 0
+    c.list_objects("b") ! if E is .protocol : count++
+    c.list_objects("b") ! if E is .protocol : count++
+    c.list_objects("b") ! if E is .protocol : count++
+    assert(count == 3)
     assert(await running)
 }

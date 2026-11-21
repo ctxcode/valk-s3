@@ -24,30 +24,6 @@ The SHA-256 of an empty body, as lowercase hex.
 
 The payload hash of a request whose body is not signed.
 
-## Errors for 'main'
-
-```js
-// Thrown by every operation of this package.
-+ error Error (not_found, access_denied, response, connection, timeout, io, invalid, protocol) payload { message: String, s3_code: String (""), status: u16 (0), request_id: String ("") }
-```
-
-### Error
-
-Thrown by every operation of this package.
-
-- `not_found`: the bucket or the object does not exist (`NoSuchKey`, `NoSuchBucket`, or a
-  404 answer without a body).
-- `access_denied`: the credentials are wrong, or not allowed to do this (403).
-- `response`: the server answered with any other error; `s3_code` says which.
-- `connection`: the server could not be reached, or the connection broke.
-- `timeout`: the server did not answer in time.
-- `io`: reading the local file or stream, or writing the output, failed.
-- `invalid`: an argument or the settings cannot be used, such as an empty bucket name.
-- `protocol`: the server sent an answer this package cannot read.
-
-`s3_code` holds the error code the server sent, such as `NoSuchKey` or `SlowDown`, `status`
-the HTTP status, and `request_id` the id the server gave the request, for its logs.
-
 ## Functions for 'main'
 
 ```js
@@ -438,6 +414,45 @@ public buckets accept.
 ### DeleteFailure
 
 A key that `delete_objects` could not delete, with the server's error code and message.
+
+```js
+// Thrown by every operation of this package.
++ union Error {
+    not_found(String, String, u16, String)
+    access_denied(String, String, u16, String)
+    response(String, String, u16, String)
+    connection(String)
+    timeout(String)
+    io(String)
+    invalid(String)
+    protocol(String)
+
+    + get message: String
+    + get request_id: String
+    + get s3_code: String
+    + get status: u16
+    + fn to_string() String
+}
+```
+
+### Error
+
+Thrown by every operation of this package.
+
+- `not_found(message, s3_code, status, request_id)`: the bucket or the object does not exist
+  (`NoSuchKey`, `NoSuchBucket`, or a 404 answer without a body).
+- `access_denied(message, s3_code, status, request_id)`: the credentials are wrong, or not
+  allowed to do this (403).
+- `response(message, s3_code, status, request_id)`: the server answered with any other error;
+  `s3_code` says which.
+- `connection(message)`: the server could not be reached, or the connection broke.
+- `timeout(message)`: the server did not answer in time.
+- `io(message)`: reading the local file or stream, or writing the output, failed.
+- `invalid(message)`: an argument or the settings cannot be used, such as an empty bucket name.
+- `protocol(message)`: the server sent an answer this package cannot read.
+
+`s3_code` holds the error code the server sent, such as `NoSuchKey` or `SlowDown`, `status`
+the HTTP status, and `request_id` the id the server gave the request, for its logs.
 
 ```js
 // Settings for a download.

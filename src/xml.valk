@@ -30,7 +30,7 @@ class XmlNode {
 }
 
 fn xml_error(message: String) !Error $throw {
-    throw .protocol { message: "Cannot read the answer of the server: " + message }
+    throw .protocol("Cannot read the answer of the server: " + message)
 }
 
 // The root element of `text`

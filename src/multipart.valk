@@ -1,16 +1,11 @@
 use valk.io
 use valk.mem
 
-// What one part upload ended with; coroutine errors cannot carry a payload
+// What one part upload ended with
 class PartResult {
     number: uint
     etag: String ("")
-    failed: bool (false)
-    kind: String ("")
-    message: String ("")
-    s3_code: String ("")
-    status: u16 (0)
-    request_id: String ("")
+    err: ?Error (null)
 }
 
 extend Client {
@@ -21,7 +16,7 @@ extend Client {
         let res = this.call(req) !>
         let root = parse_xml(res.body) !>
         let upload_id = root.text_of("UploadId")
-        if upload_id.length == 0 : throw .protocol { message: "The server started a multipart upload without an upload id" }
+        if upload_id.length == 0 : throw .protocol("The server started a multipart upload without an upload id")
         return this.send_parts(bucket, key, upload_id, reader, part_size) ! {
             this.abort_upload(bucket, key, upload_id) _
             throw E
@@ -43,14 +38,14 @@ extend Client {
             if data.length == 0 && number > 0 : break
             number++
             if number > 10000 {
-                failure = PartResult { number: number, failed: true, kind: "invalid", message: "More than 10000 parts; raise Config.part_size" }
+                failure = PartResult { number: number, err: .invalid("More than 10000 parts; raise Config.part_size") }
                 break
             }
             tasks.append(co this.upload_part(bucket, key, upload_id, number, data))
             if tasks.length >= concurrency {
                 let task = tasks.pop_first() ! break
                 let result = await task
-                if result.failed {
+                if isset(result.err) {
                     failure = result
                     break
                 }
@@ -61,11 +56,11 @@ extend Client {
         // Every started part is awaited, also after a failure
         each tasks as task {
             let result = await task
-            if result.failed && !isset(failure) : failure = result
+            if isset(result.err) && !isset(failure) : failure = result
             etags.append(result.etag)
         }
         if isset(failure) : throw_part(failure)
-        if read_failed : throw .io { message: "Reading the data to upload failed" }
+        if read_failed : throw .io("Reading the data to upload failed")
 
         let body = ByteBuffer.new(etags.length * 80 + 64)
         body.write("<CompleteMultipartUpload>")
@@ -89,7 +84,7 @@ extend Client {
     fn upload_part(bucket: String, key: String, upload_id: String, number: uint, data: String) PartResult {
         let query = Map[String]{ "partNumber" => number.to_string(), "uploadId" => upload_id }
         let res = this.call(Request { method: "PUT", bucket: bucket, key: key, query: query, body: data }) ! {
-            return PartResult { number: number, failed: true, kind: E.code.name(), message: E.message, s3_code: E.s3_code, status: E.status, request_id: E.request_id }
+            return PartResult { number: number, err: E }
         }
         return PartResult { number: number, etag: res.headers.get("etag") !? "" }
     }
@@ -100,15 +95,20 @@ extend Client {
 }
 
 fn throw_part(r: PartResult) !Error $throw {
-    let message = "Part %{r.number}: " + r.message
-    if r.kind == "not_found" : throw .not_found { message: message, s3_code: r.s3_code, status: r.status, request_id: r.request_id }
-    if r.kind == "access_denied" : throw .access_denied { message: message, s3_code: r.s3_code, status: r.status, request_id: r.request_id }
-    if r.kind == "connection" : throw .connection { message: message }
-    if r.kind == "timeout" : throw .timeout { message: message }
-    if r.kind == "invalid" : throw .invalid { message: message }
-    if r.kind == "protocol" : throw .protocol { message: message }
-    if r.kind == "io" : throw .io { message: message }
-    throw .response { message: message, s3_code: r.s3_code, status: r.status, request_id: r.request_id }
+    let err = r.err
+    if !isset(err) : throw .protocol("Part %{r.number}: failed")
+    let prefix = "Part %{r.number}: "
+    let prefixed: Error = match err : Error {
+        .not_found(msg, code, status, id) => .not_found(prefix + msg, code, status, id)
+        .access_denied(msg, code, status, id) => .access_denied(prefix + msg, code, status, id)
+        .response(msg, code, status, id) => .response(prefix + msg, code, status, id)
+        .connection(msg) => .connection(prefix + msg)
+        .timeout(msg) => .timeout(prefix + msg)
+        .io(msg) => .io(prefix + msg)
+        .invalid(msg) => .invalid(prefix + msg)
+        .protocol(msg) => .protocol(prefix + msg)
+    }
+    throw prefixed
 }
 
 // Up to `max` bytes, fewer only at the end of the stream
@@ -119,8 +119,8 @@ fn read_full(reader: io.Reader, max: uint) String !Error {
         if want > 1024 * 1024 : want = 1024 * 1024
         buf.reserve(want)
         let n = reader.read(buf.view_spare(want)) ! {
-            if error_is(E.code, closed) : break
-            throw .io { message: "Reading the data to upload failed" }
+            if E is .closed : break
+            throw .io("Reading the data to upload failed")
         }
         if n == 0 : break
         buf.skip(n)

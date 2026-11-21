@@ -44,7 +44,7 @@ test "Multipart: put_file small and large" {
 
     let failed = false
     c.put_file(bucket, "x", tmp_dir() + "/does-not-exist") ! {
-        failed = E.code == E.io
+        failed = E is .io
     }
     assert(failed)
 }
@@ -81,7 +81,7 @@ test "Multipart: a failed upload is aborted" {
     let c = multipart_client(2)
     let failed = false
     c.put_object("valk-s3-no-such-bucket", "big", pattern(7 * 1024 * 1024)) ! {
-        failed = E.code == E.not_found && E.s3_code == "NoSuchBucket"
+        failed = E is .not_found && E.s3_code == "NoSuchBucket"
     }
     assert(failed)
 }

@@ -4,7 +4,7 @@ An S3 client for [Valk](https://valk-lang.dev): AWS S3 and the S3-compatible ser
 MinIO, Cloudflare R2, DigitalOcean Spaces and Backblaze B2. Uploads, downloads, listings,
 multipart uploads, presigned URLs and buckets, signed with AWS Signature Version 4.
 
-Requires Valk 0.7.8 or newer.
+Requires Valk 0.9.1 or newer.
 
 ## Install
 
@@ -136,10 +136,10 @@ Anyone with the URL can download or upload that one key until it expires (at mos
 
 ## Errors
 
-Every method throws `s3.Error`, with `s3_code` (such as `NoSuchKey`), `status`, `request_id` and
-a `message`:
+Every method throws `s3.Error` (a tagged union), with getters `s3_code` (such as `NoSuchKey`),
+`status`, `request_id` and `message`, and `to_string()` conversion to `String`:
 
-| code | when |
+| variant | when |
 | --- | --- |
 | `not_found` | the bucket or the object does not exist |
 | `access_denied` | the credentials are wrong or not allowed to do this |

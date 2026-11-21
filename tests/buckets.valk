@@ -14,14 +14,14 @@ test "Buckets: create, list, delete" {
 
     let code = ""
     c.create_bucket(bucket) ! {
-        if E.code == E.response : code = E.s3_code
+        if E is .response : code = E.s3_code
     }
     assert(code == "BucketAlreadyOwnedByYou")
 
     c.put_object(bucket, "x", "1") !!
     code = ""
     c.delete_bucket(bucket) ! {
-        if E.code == E.response : code = E.s3_code
+        if E is .response : code = E.s3_code
     }
     assert(code == "BucketNotEmpty")
     c.delete_object(bucket, "x") !!

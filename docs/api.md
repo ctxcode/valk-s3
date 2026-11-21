@@ -16,13 +16,6 @@ Namespaces: [main](#main)
 + value UNSIGNED_PAYLOAD ("UNSIGNED-PAYLOAD")
 ```
 
-## Errors for 'main'
-
-```js
-// Thrown by every operation of this package.
-+ error Error (not_found, access_denied, response, connection, timeout, io, invalid, protocol) payload { message: String, s3_code: String (""), status: u16 (0), request_id: String ("") }
-```
-
 ## Functions for 'main'
 
 ```js
@@ -135,6 +128,26 @@ Namespaces: [main](#main)
     + code: String
     + key: String
     + message: String
+}
+```
+
+```js
+// Thrown by every operation of this package.
++ union Error {
+    not_found(String, String, u16, String)
+    access_denied(String, String, u16, String)
+    response(String, String, u16, String)
+    connection(String)
+    timeout(String)
+    io(String)
+    invalid(String)
+    protocol(String)
+
+    + get message: String
+    + get request_id: String
+    + get s3_code: String
+    + get status: u16
+    + fn to_string() String
 }
 ```
 
