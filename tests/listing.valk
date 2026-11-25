@@ -4,7 +4,7 @@ test "Listing: pages, prefixes and the iterator" {
     let c = client()
     let bucket = fresh_bucket(c, "listing")
     each 0 .. 25 as i {
-        c.put_object(bucket, "logs/" + ("" + i).pad_left('0', 2) + ".txt", "x" + i) !!
+        c.put_object(bucket, "logs/" + ("" + i).pad_left(2, '0') + ".txt", "x" + i) !!
     }
     c.put_object(bucket, "photos/a/1.jpg", "1") !!
     c.put_object(bucket, "photos/b/2.jpg", "2") !!

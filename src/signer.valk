@@ -97,18 +97,18 @@ class Pair {
 
     - fn signature(date: String, canonical: String) String {
         let scope = this.scope(date)
-        let to_sign = ALGORITHM + "\n" + date + "\n" + scope + "\n" + crypto.hash_hex(crypto.HashAlgorithm.sha256, canonical)
-        return crypto.Hmac.sign_hex(crypto.HashAlgorithm.sha256, this.signing_key(scope), to_sign)
+        let to_sign = ALGORITHM + "\n" + date + "\n" + scope + "\n" + crypto.hash_hex(canonical, crypto.HashAlgorithm.sha256)
+        return crypto.Hmac.sign_hex(to_sign, crypto.HashAlgorithm.sha256, this.signing_key(scope))
     }
 
     // The derived key only changes with the day, so it is kept
     - fn signing_key(scope: String) String {
         if scope == this.key_scope : return this.key
         let alg = crypto.HashAlgorithm.sha256
-        let k = crypto.Hmac.sign(alg, "AWS4" + this.secret_key, scope.range(0, 8))
-        k = crypto.Hmac.sign(alg, k, this.region)
-        k = crypto.Hmac.sign(alg, k, this.service)
-        k = crypto.Hmac.sign(alg, k, "aws4_request")
+        let k = crypto.Hmac.sign(scope.range(0, 8), alg, "AWS4" + this.secret_key)
+        k = crypto.Hmac.sign(this.region, alg, k)
+        k = crypto.Hmac.sign(this.service, alg, k)
+        k = crypto.Hmac.sign("aws4_request", alg, k)
         this.key_scope = scope
         this.key = k
         return k

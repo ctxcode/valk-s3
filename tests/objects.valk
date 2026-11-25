@@ -11,7 +11,7 @@ test "Objects: put, get, head, delete" {
         metadata: .{ "Owner" => "ada", "x" => "1" }
         headers: .{ "Cache-Control" => "max-age=60" }
     }) !!
-    assert(etag == crypto.hash_hex(crypto.HashAlgorithm.md5, "Hello world"))
+    assert(etag == crypto.hash_hex("Hello world", crypto.HashAlgorithm.md5))
     assert((c.get_object(bucket, "hello.txt") !! ) == "Hello world")
 
     let info = c.head_object(bucket, "hello.txt") !!
@@ -111,7 +111,7 @@ test "Objects: copy" {
     let bucket = fresh_bucket(c, "copy")
     c.put_object(bucket, "src", "copy me", s3.PutOptions { content_type: "text/x-test", metadata: .{ "k" => "v" } }) !!
     let etag = c.copy_object(bucket, "src", bucket, "dir/kept copy") !!
-    assert(etag == crypto.hash_hex(crypto.HashAlgorithm.md5, "copy me"))
+    assert(etag == crypto.hash_hex("copy me", crypto.HashAlgorithm.md5))
     let kept = c.head_object(bucket, "dir/kept copy") !!
     assert(kept.content_type == "text/x-test")
     assert((kept.metadata.get("k") !? "") == "v")

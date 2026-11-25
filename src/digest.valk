@@ -27,13 +27,13 @@ extern fn EVP_sha256() EVP_MD;
     if data.length == 0 : return EMPTY_SHA256
     @unsafe
     let ctx = EVP_MD_CTX_new()
-    if !isset(ctx) : return crypto.hash_hex(crypto.HashAlgorithm.sha256, data)
+    if !isset(ctx) : return crypto.hash_hex(data, crypto.HashAlgorithm.sha256)
     let digest: [u8 x 32] = @undefined
     let ok = EVP_DigestInit_ex(ctx, EVP_sha256(), null) == 1
     if ok : ok = EVP_DigestUpdate(ctx, data.data, data.length) == 1
     if ok : ok = EVP_DigestFinal_ex(ctx, @ref(digest), null) == 1
     EVP_MD_CTX_free(ctx)
-    if !ok : return crypto.hash_hex(crypto.HashAlgorithm.sha256, data)
+    if !ok : return crypto.hash_hex(data, crypto.HashAlgorithm.sha256)
     let raw: local &[u8] = &digest
     return crypto.hex_encode(raw)
 }

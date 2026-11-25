@@ -153,7 +153,7 @@ extend Client {
             body.write("</Delete>")
             let text = body.to_string()
             let req = Request { method: "POST", bucket: bucket, query: Map[String]{ "delete" => "" }, body: text }
-            req.headers.set("content-md5", crypto.base64_encode(crypto.hash(crypto.HashAlgorithm.md5, text)))
+            req.headers.set("content-md5", crypto.base64_encode(crypto.hash(text, crypto.HashAlgorithm.md5)))
             req.headers.set("content-type", "application/xml")
             let res = this.call(req) !>
             let root = parse_xml(res.body) !>
